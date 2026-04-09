@@ -1,0 +1,146 @@
+=====================================================================
+  WMS DATABASE SCHEMA NOTES
+  Martin Personal Project — New WMS System
+  Created: 2026-04-08
+=====================================================================
+
+Each database table and its columns are described below.
+Logic and business rules for each header will be added later.
+
+---------------------------------------------------------------------
+1. ORDER HEADER
+---------------------------------------------------------------------
+Columns:
+  - Order              : Unique order identifier
+  - Client ID          : Reference to the client placing the order
+  - Instructions       : Special handling or delivery instructions
+  - Status             : Current order status (e.g. Open, Allocated, Picked, Shipped, Cancelled)
+  - Order Date         : Date the order was placed
+  - Order Time         : Time the order was placed
+  - Order Weight       : Total weight of the order
+  - Order Volume       : Total volume of the order
+  - Number of Lines    : How many order lines exist on this order
+  - Created By         : User who created the order
+  - Creation Date      : Date the order record was created
+  - Creation Time      : Time the order record was created
+  - Shipped Date       : Date the order was shipped
+  - Shipped Time       : Time the order was shipped
+  - Customer Name      : End-customer name
+  - Email              : Customer email address
+  - Phone              : Customer phone number
+  - Town               : Customer town/city
+  - Postcode           : Customer postcode/zip
+  - Address 1          : Primary address line
+  - Address 2          : Secondary address line
+  - User Defined Type 1-5 : Custom fields for client-specific data
+  - Deliver By Date    : Required delivery deadline
+
+---------------------------------------------------------------------
+2. ORDER LINES
+---------------------------------------------------------------------
+Columns:
+  - Order              : Parent order reference
+  - Line ID            : Unique line identifier within the order
+  - Notes              : Line-level notes or instructions
+  - SKU                : Stock Keeping Unit — product code
+  - Description        : Product description
+  - Qty Ordered        : Quantity originally ordered
+  - Qty Allocated      : Quantity allocated from inventory
+  - Qty Picked         : Quantity picked in the warehouse
+  - Qty Shipped        : Quantity actually shipped
+  - Creation Date      : Date this line was created
+  - Creation Time      : Time this line was created
+  - User Defined Type 1-5 : Custom fields for client-specific data
+
+---------------------------------------------------------------------
+3. CLIENTS
+---------------------------------------------------------------------
+Columns:
+  - Client ID          : Unique client identifier
+  - Client Name        : Name of the client/company
+  - Client Address     : Main address description
+  - Email              : Client contact email
+  - Phone              : Client contact phone
+  - Town               : Client town/city
+  - Postcode           : Client postcode/zip
+  - Address 1          : Primary address line
+  - Address 2          : Secondary address line
+  - User Defined Type 1-5 : Custom fields for client-specific data
+
+---------------------------------------------------------------------
+4. INVENTORY
+---------------------------------------------------------------------
+Columns:
+  - Client ID          : Which client owns this stock
+  - SKU                : Product code
+  - Location           : Warehouse location where stock is held
+  - Qty Available      : Quantity available for allocation
+  - Qty Allocated      : Quantity currently allocated to orders
+  - Tag ID             : Pallet/container tag identifier
+  - Lock Status        : Whether inventory is locked (e.g. QC hold)
+  - Description        : Product or stock description
+  - User Defined Type 1-5 : Custom fields for client-specific data
+
+---------------------------------------------------------------------
+5. INVENTORY TRANSACTION
+---------------------------------------------------------------------
+Columns:
+  - Code               : Transaction code (references Transaction Codes table)
+  - Client ID          : Client associated with the transaction
+  - SKU                : Product code involved
+  - Location           : Warehouse location
+  - Qty Available      : Available quantity after transaction
+  - Qty Allocated      : Allocated quantity after transaction
+  - Tag ID             : Pallet/container tag
+  - Lock Status        : Lock status of the inventory
+  - Description        : Transaction description/notes
+  - Order              : Related order reference (if applicable)
+
+---------------------------------------------------------------------
+6. TRANSACTION CODES
+---------------------------------------------------------------------
+These are the valid transaction type codes used in inventory transactions:
+  - Stock check        : Physical stock count/verification
+  - Allocate           : Allocate inventory to an order
+  - Pick               : Pick inventory for an order
+  - Ship               : Ship inventory out
+  - Order              : Order-related transaction
+  - Delete             : Remove/delete inventory record
+  - Relocate           : Move inventory between locations
+
+---------------------------------------------------------------------
+7. LOCATION
+---------------------------------------------------------------------
+Columns:
+  - Location           : Unique location identifier
+  - Location Type      : Type of location (e.g. Rack, Floor, Staging)
+  - Check String       : Barcode or validation string for location
+  - Status             : Location status (e.g. Active, Inactive)
+  - Volume             : Maximum volume capacity
+  - Weight             : Maximum weight capacity
+  - Height             : Location height dimension
+  - Width              : Location width dimension
+  - Depth              : Location depth dimension
+  - Sub Zone 1         : Primary sub-zone grouping
+  - Sub Zone 2         : Secondary sub-zone grouping
+  - Aisle              : Aisle identifier
+  - Bay                : Bay identifier
+  - Level              : Level/shelf identifier
+  - Position           : Position within the bay
+  - User Defined Type 1-5 : Custom fields for client-specific data
+
+---------------------------------------------------------------------
+8. SKU
+---------------------------------------------------------------------
+Columns:
+  - SKU                : Unique product code
+  - Description        : Product description
+  - Each Height        : Height per unit
+  - Each Width         : Width per unit
+  - Each Volume        : Volume per unit
+  - Each Weight        : Weight per unit
+  - Client ID          : Which client this SKU belongs to
+
+=====================================================================
+  MORE TABLES TO COME — Logic for each header to be added later.
+=====================================================================

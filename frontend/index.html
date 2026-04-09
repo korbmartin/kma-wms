@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>KMA WMS</title>
+  <link rel="stylesheet" href="style.css" />
+  <script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
+</head>
+<body>
+  <header>
+    <div class="header-top">
+      <h1>KMA</h1>
+      <div class="subtitle">Warehouse Management System</div>
+    </div>
+    <nav class="top-nav">
+      <button class="nav-btn" id="kpiNavBtn">KPI</button>
+      <div class="nav-dropdown">
+        <button class="nav-dropdown-toggle">Actions</button>
+        <div class="nav-dropdown-menu" id="menuActions">
+          <span class="nav-empty">Coming soon</span>
+        </div>
+      </div>
+      <div class="nav-dropdown">
+        <button class="nav-dropdown-toggle" id="importNavBtn">Import</button>
+        <div class="nav-dropdown-menu" id="menuImport">
+          <button data-import="order">Orders + Lines</button>
+          <button data-import="pre_advice">Pre-Advice + Lines</button>
+        </div>
+      </div>
+      <div class="nav-dropdown">
+        <button class="nav-dropdown-toggle">Data</button>
+        <div class="nav-dropdown-menu" id="menuData"></div>
+      </div>
+      <div class="nav-dropdown">
+        <button class="nav-dropdown-toggle">Other</button>
+        <div class="nav-dropdown-menu" id="menuOther"></div>
+      </div>
+    </nav>
+  </header>
+
+  <main>
+    <!-- KPI Dashboard (welcome page) -->
+    <section id="kpiPage" class="kpi-page">
+      <div class="kpi-layout">
+        <!-- Left: Monthly data -->
+        <div class="kpi-left">
+          <div class="kpi-month-bar">
+            <button id="kpiPrevMonth" class="kpi-month-btn">&lsaquo;</button>
+            <span class="kpi-month-label" id="kpiMonth"></span>
+            <button id="kpiNextMonth" class="kpi-month-btn">&rsaquo;</button>
+          </div>
+          <!-- Outbound Group -->
+          <div class="kpi-group">
+            <div class="kpi-group-title">Outbound</div>
+            <div class="kpi-cards">
+              <div class="kpi-card">
+                <div class="kpi-value" id="kpiOrdersShipped">&mdash;</div>
+                <div class="kpi-label">Orders Shipped</div>
+              </div>
+              <div class="kpi-card">
+                <div class="kpi-value" id="kpiLinesShipped">&mdash;</div>
+                <div class="kpi-label">Lines Shipped</div>
+              </div>
+              <div class="kpi-card">
+                <div class="kpi-value" id="kpiQtyShipped">&mdash;</div>
+                <div class="kpi-label">Qty Shipped</div>
+              </div>
+            </div>
+          </div>
+          <!-- Inbound Group -->
+          <div class="kpi-group">
+            <div class="kpi-group-title">Inbound</div>
+            <div class="kpi-cards">
+              <div class="kpi-card">
+                <div class="kpi-value" id="kpiPreAdvicesReceived">&mdash;</div>
+                <div class="kpi-label">Pre-Advices Received</div>
+              </div>
+              <div class="kpi-card">
+                <div class="kpi-value" id="kpiLinesReceived">&mdash;</div>
+                <div class="kpi-label">Lines Received</div>
+              </div>
+              <div class="kpi-card">
+                <div class="kpi-value" id="kpiQtyReceived">&mdash;</div>
+                <div class="kpi-label">Qty Received</div>
+              </div>
+            </div>
+          </div>
+          <!-- Operations Group -->
+          <div class="kpi-group">
+            <div class="kpi-group-title">Operations</div>
+            <div class="kpi-cards">
+              <div class="kpi-card">
+                <div class="kpi-value" id="kpiStockChecks">&mdash;</div>
+                <div class="kpi-label">Stock Checks Done</div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <!-- Right: Inventory snapshot -->
+        <div class="kpi-right">
+          <div class="kpi-group">
+            <div class="kpi-group-title">Inventory</div>
+            <div class="kpi-cards kpi-cards-vertical">
+              <div class="kpi-card">
+                <div class="kpi-value" id="kpiTotalStockQty">&mdash;</div>
+                <div class="kpi-label">Total Stock (Qty)</div>
+              </div>
+              <div class="kpi-card">
+                <div class="kpi-value" id="kpiUsedLocations">&mdash;</div>
+                <div class="kpi-label">Locations Used</div>
+              </div>
+              <div class="kpi-card">
+                <div class="kpi-value" id="kpiEmptyLocations">&mdash;</div>
+                <div class="kpi-label">Empty Locations</div>
+              </div>
+              <div class="kpi-card">
+                <div class="kpi-value" id="kpiTotalLocations">&mdash;</div>
+                <div class="kpi-label">Total Locations</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Query Page (shown when a table tab is clicked) -->
+    <section id="queryPage" class="query-page" style="display:none">
+      <div class="query-header">
+        <h2 id="queryTitle">Query</h2>
+        <p class="query-hint">Fill in any fields to filter, or leave all blank to show everything.</p>
+      </div>
+      <div id="queryFields" class="query-fields"></div>
+      <div class="query-actions">
+        <button id="queryRunBtn">Run Query</button>
+        <button id="queryClearBtn" class="btn-secondary">Clear All</button>
+        <button id="queryCreateBtn" class="btn-create">Create New</button>
+        <button id="createSubmitBtn" class="btn-create" style="display:none">Create</button>
+        <button id="createCancelBtn" class="btn-secondary" style="display:none">Cancel</button>
+      </div>
+    </section>
+
+    <!-- Results Page (table view) -->
+    <section id="resultsPage" style="display:none">
+      <div class="results-title-bar" id="resultsTitleBar"></div>
+      <div class="results-bar">
+        <button id="backToQueryBtn" class="btn-secondary">Back to Query</button>
+        <button id="rerunQueryBtn" class="btn-rerun" style="display:none">Rerun Query</button>
+        <button id="resultsCreateBtn" class="btn-create">Create New</button>
+        <button id="massCreateBtn" class="btn-mass-create" style="display:none">Mass Create</button>
+        <button id="resultsDeleteBtn" class="btn-results-delete" style="display:none">Delete Selected (<span id="selectedCount">0</span>)</button>
+        <div class="mass-status-wrapper" id="massStatusWrapper" style="display:none">
+          <button id="massStatusBtn" class="btn-mass-status">Mass Status Update (<span id="massStatusCount">0</span>)</button>
+          <div class="mass-status-dropdown" id="massStatusDropdown" style="display:none">
+            <label>New Status:</label>
+            <select id="massStatusSelect"></select>
+            <button id="massStatusConfirmBtn" class="btn-create">Confirm</button>
+            <button id="massStatusCancelBtn" class="btn-secondary">Cancel</button>
+          </div>
+        </div>
+        <div class="export-wrapper" id="exportWrapper" style="display:none">
+          <button id="exportBtn" class="btn-export">Export ▾</button>
+          <div class="export-menu" id="exportMenu">
+            <button id="exportCsv">Export as CSV</button>
+            <button id="exportXlsx">Export as Excel</button>
+          </div>
+        </div>
+        <span id="rowCount" class="row-count"></span>
+      </div>
+      <div class="table-wrapper">
+        <table id="dataTable">
+          <thead id="tableHead"></thead>
+          <tbody id="tableBody"></tbody>
+        </table>
+        <p id="emptyMsg" class="empty-msg" style="display:none">No data found.</p>
+        <p id="loadingMsg" class="loading-msg" style="display:none">Loading...</p>
+      </div>
+    </section>
+
+    <!-- Mass Create Overlay -->
+    <div id="massCreateOverlay" class="mass-create-overlay" style="display:none">
+      <div class="mass-create-panel">
+        <div class="mass-create-header">
+          <h2 id="massCreateTitle">Mass Create</h2>
+          <div class="mass-create-header-actions">
+            <span id="massCreateRowCount" class="mass-create-row-count"></span>
+            <button id="massCreateAddRowBtn" class="btn-secondary">+ Add Row</button>
+            <button id="massCreateClearBtn" class="btn-secondary">Clear All</button>
+            <button id="massCreateSubmitBtn" class="btn-create">Submit All</button>
+            <button id="massCreateCloseBtn" class="detail-close">&times;</button>
+          </div>
+        </div>
+        <p class="mass-create-hint">Paste rows from Excel (Ctrl+V). Tab-separated columns will auto-fill the grid.</p>
+        <div class="mass-create-table-wrapper">
+          <table id="massCreateTable" class="mass-create-table">
+            <thead id="massCreateHead"></thead>
+            <tbody id="massCreateBody"></tbody>
+          </table>
+        </div>
+        <div id="massCreateStatus" class="mass-create-status"></div>
+      </div>
+    </div>
+
+    <!-- Mass Result Popup -->
+    <div id="massResultOverlay" class="mass-result-overlay" style="display:none">
+      <div class="mass-result-panel">
+        <div class="mass-result-header">
+          <h2 id="massResultTitle">Mass Create Results</h2>
+          <button id="massResultCloseBtn" class="detail-close">&times;</button>
+        </div>
+        <div id="massResultBody" class="mass-result-body"></div>
+      </div>
+    </div>
+
+    <!-- Detail Overlay -->
+    <div id="detailOverlay" class="detail-overlay" style="display:none">
+      <div class="detail-panel">
+        <div class="detail-header">
+          <h2 id="detailTitle">Record Details</h2>
+          <button id="detailCloseBtn" class="detail-close">&times;</button>
+        </div>
+        <div id="detailFields" class="detail-fields"></div>
+        <div class="detail-actions">
+          <button id="detailEditBtn" class="btn-detail-edit">Edit</button>
+          <button id="detailLinesBtn" class="btn-detail-lines" style="display:none">Lines</button>
+          <button id="detailDeleteBtn" class="btn-delete">Delete</button>
+          <button id="detailSaveBtn" class="btn-create" style="display:none">Save</button>
+          <button id="detailCancelBtn" class="btn-secondary" style="display:none">Cancel</button>
+        </div>
+      </div>
+    </div>
+    <!-- Import Overlay -->
+    <div id="importOverlay" class="import-overlay" style="display:none">
+      <div class="import-panel">
+        <div class="import-header">
+          <h2 id="importTitle">Import</h2>
+          <div class="import-header-actions">
+            <span id="importRowCount" class="mass-create-row-count"></span>
+            <button id="importTemplateBtn" class="btn-secondary">Export Template</button>
+            <button id="importAddRowBtn" class="btn-secondary">+ Add Row</button>
+            <button id="importClearBtn" class="btn-secondary">Clear All</button>
+            <button id="importSubmitBtn" class="btn-create">Submit All</button>
+            <button id="importCloseBtn" class="detail-close">&times;</button>
+          </div>
+        </div>
+        <p class="mass-create-hint">Combined headers from both tables. Shared fields (marked <span style="color:#60a5fa">blue</span>) populate both. Paste from Excel supported (Ctrl+V).</p>
+        <div class="import-legend">
+          <span class="import-legend-item"><span class="import-dot import-dot-header"></span> Header only</span>
+          <span class="import-legend-item"><span class="import-dot import-dot-line"></span> Line only</span>
+          <span class="import-legend-item"><span class="import-dot import-dot-shared"></span> Shared</span>
+        </div>
+        <div class="mass-create-table-wrapper">
+          <table id="importTable" class="mass-create-table import-table">
+            <thead id="importHead"></thead>
+            <tbody id="importBody"></tbody>
+          </table>
+        </div>
+        <div id="importStatus" class="mass-create-status"></div>
+      </div>
+    </div>
+
+  </main>
+
+  <!-- Bottom tab bar -->
+  <footer id="tabBar" class="tab-bar"></footer>
+
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,13 @@
+name = "martin-wms"
+main = "cloudflare/worker.js"
+compatibility_date = "2026-04-10"
+compatibility_flags = ["nodejs_compat"]
+
+[assets]
+directory = "./frontend"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+
+[vars]
+SUPABASE_URL = "https://fvrvfioqfgvmvdgnniyu.supabase.co"
+SUPABASE_PUBLISHABLE_KEY = "sb_publishable_s-f5r8mvwsUw2elcCidvgw_K0LawYRr"
