@@ -112,6 +112,51 @@ const STATUS_LOG_FIELDS = {
   },
 };
 
+const TABLE_COLUMN_FALLBACKS = {
+  sku: [
+    { column_name: "sku", data_type: "text" },
+    { column_name: "description", data_type: "text" },
+    { column_name: "each_height", data_type: "numeric" },
+    { column_name: "each_width", data_type: "numeric" },
+    { column_name: "each_volume", data_type: "numeric" },
+    { column_name: "each_weight", data_type: "numeric" },
+    { column_name: "client_id", data_type: "text" },
+  ],
+  inventory: [
+    { column_name: "id", data_type: "integer" },
+    { column_name: "client_id", data_type: "text" },
+    { column_name: "sku", data_type: "text" },
+    { column_name: "location", data_type: "text" },
+    { column_name: "qty_available", data_type: "integer" },
+    { column_name: "qty_allocated", data_type: "integer" },
+    { column_name: "tag_id", data_type: "text" },
+    { column_name: "lock_status", data_type: "text" },
+    { column_name: "description", data_type: "text" },
+    { column_name: "user_defined_type_1", data_type: "text" },
+    { column_name: "user_defined_type_2", data_type: "text" },
+    { column_name: "user_defined_type_3", data_type: "text" },
+    { column_name: "user_defined_type_4", data_type: "text" },
+    { column_name: "user_defined_type_5", data_type: "text" },
+  ],
+  inventory_transaction: [
+    { column_name: "id", data_type: "integer" },
+    { column_name: "code", data_type: "text" },
+    { column_name: "type", data_type: "text" },
+    { column_name: "client_id", data_type: "text" },
+    { column_name: "sku", data_type: "text" },
+    { column_name: "location", data_type: "text" },
+    { column_name: "tag_id", data_type: "text" },
+    { column_name: "description", data_type: "text" },
+    { column_name: "status", data_type: "text" },
+    { column_name: "qty", data_type: "integer" },
+    { column_name: "order", data_type: "text" },
+    { column_name: "pre_advice_id", data_type: "text" },
+    { column_name: "order_line_id", data_type: "text" },
+    { column_name: "pre_advice_line_id", data_type: "text" },
+    { column_name: "created_at", data_type: "timestamp" },
+  ],
+};
+
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET,POST,PUT,DELETE,OPTIONS",
@@ -134,7 +179,10 @@ function responseJson(payload, status = 200) {
 function sanitizeMessage(err) {
   if (!err) return "Unknown error";
   if (typeof err === "string") return err;
-  if (typeof err.message === "string") return err.message;
+  if (typeof err.message === "string" && err.message.trim() !== "") return err.message;
+  if (typeof err.details === "string" && err.details.trim() !== "") return err.details;
+  if (typeof err.hint === "string" && err.hint.trim() !== "") return err.hint;
+  if (typeof err.code === "string" && err.code.trim() !== "") return `Database error: ${err.code}`;
   return JSON.stringify(err);
 }
 
@@ -238,6 +286,10 @@ function isValidColumnName(column) {
   return /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(column);
 }
 
+function pgCol(column) {
+  return column === "order" ? "\"order\"" : column;
+}
+
 function normalizeRowValues(row) {
   const normalized = {};
   for (const [col, val] of Object.entries(row || {})) {
@@ -269,7 +321,7 @@ function applyCreationTimestamp(row) {
 function applyPkFilters(query, pks, pkValues) {
   let q = query;
   for (const pk of pks) {
-    q = q.eq(pk, pkValues[pk]);
+    q = q.eq(pgCol(pk), pkValues[pk]);
   }
   return q;
 }
@@ -329,6 +381,10 @@ async function fetchTableColumns(supabase, tableName, sampleRows = []) {
     }));
   }
 
+  if (TABLE_COLUMN_FALLBACKS[tableName]) {
+    return TABLE_COLUMN_FALLBACKS[tableName];
+  }
+
   return [];
 }
 
@@ -347,7 +403,7 @@ async function getValidClientSet(supabase) {
 
 async function getNextLineId(supabase, tableName, parentCol, parentValue) {
   const rows = await fetchAllRows(
-    () => supabase.from(tableName).select("line_id").eq(parentCol, parentValue),
+    () => supabase.from(tableName).select("line_id").eq(pgCol(parentCol), parentValue),
     1000,
     200000
   );
@@ -363,13 +419,13 @@ async function getNextLineId(supabase, tableName, parentCol, parentValue) {
 
 async function updateLineCount(supabase, cfg, parentValue) {
   const count = await getCount(
-    supabase.from(cfg.linesTable).select("*", { head: true, count: "exact" }).eq(cfg.parentCol, parentValue)
+    supabase.from(cfg.linesTable).select("*", { head: true, count: "exact" }).eq(pgCol(cfg.parentCol), parentValue)
   );
 
   const { error } = await supabase
     .from(cfg.parentTable)
     .update({ [cfg.countCol]: count })
-    .eq(cfg.parentCol, parentValue);
+    .eq(pgCol(cfg.parentCol), parentValue);
 
   if (error) throw error;
 }
@@ -377,7 +433,7 @@ async function updateLineCount(supabase, cfg, parentValue) {
 async function existsByFilters(supabase, tableName, filters) {
   let query = supabase.from(tableName).select("*", { head: true, count: "exact" });
   for (const [col, val] of Object.entries(filters)) {
-    query = query.eq(col, val);
+    query = query.eq(pgCol(col), val);
   }
   const count = await getCount(query);
   return count > 0;
@@ -501,14 +557,14 @@ async function handleGetData(supabase, tableKey, searchParams) {
     if (!isValidColumnName(column)) {
       return responseJson({ error: "Invalid column name" }, 400);
     }
-    query = query.ilike(column, `%${search}%`);
+    query = query.ilike(pgCol(column), `%${search}%`);
   }
 
   for (const [key, value] of searchParams.entries()) {
     if (["search", "column", "limit", "offset"].includes(key)) continue;
     if (!isValidColumnName(key)) continue;
     if (value === "") continue;
-    query = query.ilike(key, `%${value}%`);
+    query = query.ilike(pgCol(key), `%${value}%`);
   }
 
   const lim = Math.min(parseIntSafe(limitRaw, 500) || 500, 5000);
@@ -1041,7 +1097,7 @@ async function handleKpi(supabase, searchParams) {
     () =>
       supabase
         .from("order_header")
-        .select("order")
+        .select("\"order\"")
         .eq("status", "Shipped")
         .gte("shipped_date", monthStart)
         .lt("shipped_date", nextMonth),
@@ -1055,7 +1111,7 @@ async function handleKpi(supabase, searchParams) {
     const chunks = chunkArray(shippedOrders, 200);
     for (const chunk of chunks) {
       const lineRows = await fetchAllRows(
-        () => supabase.from("order_lines").select("qty_shipped").in("order", chunk),
+        () => supabase.from("order_lines").select("qty_shipped").in(pgCol("order"), chunk),
         1000,
         200000
       );
