@@ -1,7 +1,17 @@
-name = "martin-wms"
+﻿name = "martin-wms"
 main = "cloudflare/worker.js"
 compatibility_date = "2026-04-10"
 compatibility_flags = ["nodejs_compat"]
+workers_dev = true
+preview_urls = true
+
+[[routes]]
+pattern = "kma-wms.com"
+custom_domain = true
+
+[[routes]]
+pattern = "www.kma-wms.com"
+custom_domain = true
 
 [assets]
 directory = "./frontend"
