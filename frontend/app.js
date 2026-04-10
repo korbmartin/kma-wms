@@ -1,6 +1,12 @@
 const API_BASE = "/api";
+const AUTH_TOKEN_KEY = "wms_auth_token";
+const AUTH_USER_KEY = "wms_auth_user";
+let authToken = sessionStorage.getItem(AUTH_TOKEN_KEY) || "";
+let appBootstrapped = false;
 
 // ── DOM refs ───────────────────────────────────────────────────
+const appHeader = document.querySelector("header");
+const appMain = document.querySelector("main");
 const menuData = document.getElementById("menuData");
 const menuOther = document.getElementById("menuOther");
 const queryPage = document.getElementById("queryPage");
@@ -81,6 +87,12 @@ const kpiPage = document.getElementById("kpiPage");
 const kpiMonth = document.getElementById("kpiMonth");
 const kpiPrevMonth = document.getElementById("kpiPrevMonth");
 const kpiNextMonth = document.getElementById("kpiNextMonth");
+const loginOverlay = document.getElementById("loginOverlay");
+const loginForm = document.getElementById("loginForm");
+const loginUsername = document.getElementById("loginUsername");
+const loginPassword = document.getElementById("loginPassword");
+const loginSubmitBtn = document.getElementById("loginSubmitBtn");
+const loginError = document.getElementById("loginError");
 
 // KPI month state: { year, month } (1-indexed)
 let kpiSelectedMonth = null; // null = current month
@@ -200,6 +212,128 @@ function reorderColumns(cols) {
     cols.splice(1, 0, clientCol);
   }
   return cols;
+}
+
+function setAuthLocked(locked) {
+  document.body.classList.toggle("auth-locked", locked);
+  loginOverlay.style.display = locked ? "flex" : "none";
+  if (appHeader) appHeader.setAttribute("aria-hidden", locked ? "true" : "false");
+  if (appMain) appMain.setAttribute("aria-hidden", locked ? "true" : "false");
+}
+
+function showLoginError(message) {
+  loginError.textContent = message || "Login failed.";
+  loginError.style.display = "";
+}
+
+function clearLoginError() {
+  loginError.textContent = "";
+  loginError.style.display = "none";
+}
+
+function logoutAndLock(message) {
+  authToken = "";
+  sessionStorage.removeItem(AUTH_TOKEN_KEY);
+  sessionStorage.removeItem(AUTH_USER_KEY);
+  setAuthLocked(true);
+  if (message) showLoginError(message);
+  if (loginPassword) loginPassword.value = "";
+  if (loginUsername) loginUsername.focus();
+}
+
+function installAuthFetch() {
+  const nativeFetch = window.fetch.bind(window);
+  window.fetch = async (input, init = {}) => {
+    const url = typeof input === "string" ? input : input?.url || "";
+    const isApiCall = typeof url === "string" && (url.startsWith("/api/") || url.includes("/api/"));
+    if (!isApiCall) return nativeFetch(input, init);
+
+    const headers = new Headers(init.headers || {});
+    if (authToken) {
+      headers.set("Authorization", `Bearer ${authToken}`);
+    }
+
+    const response = await nativeFetch(input, { ...init, headers });
+
+    if (response.status === 401 && !url.endsWith("/api/login")) {
+      logoutAndLock("Session expired. Please log in again.");
+    }
+
+    return response;
+  };
+}
+
+async function startAppOnce() {
+  if (appBootstrapped) return;
+  appBootstrapped = true;
+  await loadTables();
+  showKpiPage();
+}
+
+async function performLoginRequest(username, password) {
+  const res = await fetch(`${API_BASE}/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username, password }),
+  });
+
+  const data = await res.json();
+  if (!res.ok || !data.success || !data.token) {
+    throw new Error(data.error || "Invalid username or password");
+  }
+
+  authToken = data.token;
+  sessionStorage.setItem(AUTH_TOKEN_KEY, authToken);
+  sessionStorage.setItem(AUTH_USER_KEY, username);
+}
+
+async function initializeAuthGate() {
+  installAuthFetch();
+
+  loginForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    clearLoginError();
+
+    const username = (loginUsername.value || "").trim();
+    const password = loginPassword.value || "";
+    if (!username || !password) {
+      showLoginError("Please enter username and password.");
+      return;
+    }
+
+    loginSubmitBtn.disabled = true;
+    loginSubmitBtn.textContent = "Logging in...";
+    try {
+      await performLoginRequest(username, password);
+      setAuthLocked(false);
+      await startAppOnce();
+    } catch (err) {
+      showLoginError(err.message || "Invalid username or password");
+      loginPassword.value = "";
+      loginPassword.focus();
+    } finally {
+      loginSubmitBtn.disabled = false;
+      loginSubmitBtn.textContent = "Log In";
+    }
+  });
+
+  if (authToken) {
+    try {
+      // Validate saved token quickly before showing app.
+      const verify = await fetch(`${API_BASE}/tables`);
+      if (!verify.ok) throw new Error("Token check failed");
+      setAuthLocked(false);
+      await startAppOnce();
+      return;
+    } catch {
+      authToken = "";
+      sessionStorage.removeItem(AUTH_TOKEN_KEY);
+      sessionStorage.removeItem(AUTH_USER_KEY);
+    }
+  }
+
+  setAuthLocked(true);
+  if (loginUsername) loginUsername.focus();
 }
 
 // Cache for dropdown options
@@ -2647,5 +2781,4 @@ kpiNavBtn.addEventListener("click", () => {
 });
 
 // ── Init ───────────────────────────────────────────────────────
-loadTables();
-showKpiPage();
+initializeAuthGate();

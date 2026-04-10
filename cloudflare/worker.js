@@ -118,6 +118,9 @@ const CORS_HEADERS = {
   "Access-Control-Allow-Headers": "Content-Type, Authorization",
 };
 
+const AUTH_TOKEN_TTL_SECONDS = 12 * 60 * 60;
+const DEFAULT_AUTH_SECRET = "kma-wms-auth-fallback-secret";
+
 function responseJson(payload, status = 200) {
   return new Response(JSON.stringify(payload), {
     status,
@@ -133,6 +136,92 @@ function sanitizeMessage(err) {
   if (typeof err === "string") return err;
   if (typeof err.message === "string") return err.message;
   return JSON.stringify(err);
+}
+
+function getAuthSecret(env) {
+  return env.AUTH_TOKEN_SECRET || env.SUPABASE_SERVICE_ROLE_KEY || DEFAULT_AUTH_SECRET;
+}
+
+function base64UrlEncodeString(value) {
+  const bytes = new TextEncoder().encode(value);
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function base64UrlDecodeString(value) {
+  const base64 = value.replace(/-/g, "+").replace(/_/g, "/");
+  const padded = base64 + "=".repeat((4 - (base64.length % 4)) % 4);
+  const binary = atob(padded);
+  const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+  return new TextDecoder().decode(bytes);
+}
+
+async function signValueHmac(value, secret) {
+  const keyData = new TextEncoder().encode(secret);
+  const cryptoKey = await crypto.subtle.importKey(
+    "raw",
+    keyData,
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const signature = await crypto.subtle.sign("HMAC", cryptoKey, new TextEncoder().encode(value));
+  const bytes = new Uint8Array(signature);
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+async function createAuthToken(username, env) {
+  const payload = {
+    u: username,
+    exp: Math.floor(Date.now() / 1000) + AUTH_TOKEN_TTL_SECONDS,
+  };
+  const payloadEncoded = base64UrlEncodeString(JSON.stringify(payload));
+  const signature = await signValueHmac(payloadEncoded, getAuthSecret(env));
+  return `${payloadEncoded}.${signature}`;
+}
+
+async function verifyAuthToken(token, env) {
+  if (!token || typeof token !== "string") return null;
+  const parts = token.split(".");
+  if (parts.length !== 2) return null;
+
+  const [payloadEncoded, signature] = parts;
+  const expectedSignature = await signValueHmac(payloadEncoded, getAuthSecret(env));
+  if (expectedSignature !== signature) return null;
+
+  try {
+    const payloadJson = base64UrlDecodeString(payloadEncoded);
+    const payload = JSON.parse(payloadJson);
+    if (!payload || typeof payload !== "object") return null;
+    if (typeof payload.exp !== "number" || payload.exp < Math.floor(Date.now() / 1000)) return null;
+    if (!payload.u || typeof payload.u !== "string") return null;
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+function getBearerToken(request) {
+  const authHeader = request.headers.get("authorization") || "";
+  const match = authHeader.match(/^Bearer\s+(.+)$/i);
+  return match ? match[1] : "";
+}
+
+async function requireAuth(request, env) {
+  const token = getBearerToken(request);
+  if (!token) {
+    return responseJson({ error: "Authentication required" }, 401);
+  }
+
+  const payload = await verifyAuthToken(token, env);
+  if (!payload) {
+    return responseJson({ error: "Invalid or expired session" }, 401);
+  }
+
+  return null;
 }
 
 function parseIntSafe(value, fallback = 0) {
@@ -348,6 +437,37 @@ function getPathParam(pathname, regex) {
 async function handleHealth(supabase) {
   await supabase.from("clients").select("client_id").limit(1);
   return responseJson({ status: "ok" });
+}
+
+async function handleLogin(supabase, request, env) {
+  const body = await parseRequestBody(request);
+  const username = typeof body?.username === "string" ? body.username.trim() : "";
+  const password = typeof body?.password === "string" ? body.password : "";
+
+  if (!username || !password) {
+    return responseJson({ error: "Username and password are required" }, 400);
+  }
+
+  const { data, error } = await supabase
+    .from("users")
+    .select("username,password")
+    .eq("username", username)
+    .limit(1);
+
+  if (error) throw error;
+
+  const userRow = Array.isArray(data) && data.length > 0 ? data[0] : null;
+  if (!userRow || String(userRow.password) !== password) {
+    return responseJson({ error: "Invalid username or password" }, 401);
+  }
+
+  const token = await createAuthToken(username, env);
+  return responseJson({
+    success: true,
+    token,
+    username,
+    expiresIn: AUTH_TOKEN_TTL_SECONDS,
+  });
 }
 
 function ensureKnownTable(tableKey) {
@@ -1048,6 +1168,13 @@ async function handleApiRequest(request, env) {
   if (request.method === "GET" && pathname === "/api/health") {
     return handleHealth(supabase);
   }
+
+  if (request.method === "POST" && pathname === "/api/login") {
+    return handleLogin(supabase, request, env);
+  }
+
+  const authError = await requireAuth(request, env);
+  if (authError) return authError;
 
   if (request.method === "GET" && pathname === "/api/tables") {
     return responseJson(Object.keys(TABLES));

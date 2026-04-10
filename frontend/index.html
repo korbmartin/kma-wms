@@ -7,7 +7,7 @@
   <link rel="stylesheet" href="style.css" />
   <script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
 </head>
-<body>
+<body class="auth-locked">
   <header>
     <div class="header-top">
       <h1>KMA</h1>
@@ -263,6 +263,22 @@
 
   <!-- Bottom tab bar -->
   <footer id="tabBar" class="tab-bar"></footer>
+
+  <!-- Login Overlay -->
+  <div id="loginOverlay" class="login-overlay">
+    <div class="login-panel">
+      <div class="login-logo">KMA</div>
+      <div class="login-subtitle">Warehouse Management System</div>
+      <form id="loginForm" class="login-form">
+        <label for="loginUsername">Username</label>
+        <input id="loginUsername" name="username" type="text" autocomplete="username" required />
+        <label for="loginPassword">Password</label>
+        <input id="loginPassword" name="password" type="password" autocomplete="current-password" required />
+        <button id="loginSubmitBtn" type="submit" class="btn-create">Log In</button>
+      </form>
+      <p id="loginError" class="login-error" style="display:none"></p>
+    </div>
+  </div>
 
   <script src="app.js"></script>
 </body>
