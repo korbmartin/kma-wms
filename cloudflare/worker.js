@@ -476,6 +476,23 @@ async function existsByFilters(supabase, tableName, filters) {
   return count > 0;
 }
 
+async function getCanonicalSkuForClient(supabase, clientId, sku) {
+  const client = String(clientId || "").trim();
+  const skuVal = String(sku || "").trim();
+  if (!client || !skuVal) return null;
+  const rows = await fetchAllRows(
+    () =>
+      supabase
+        .from("sku")
+        .select("sku,client_id")
+        .eq("client_id", client)
+        .ilike("sku", skuVal),
+    10,
+    100
+  );
+  return rows.length > 0 ? rows[0].sku : null;
+}
+
 async function logStatusChange(supabase, tableKey, pkValues) {
   const cfg = STATUS_LOG_FIELDS[tableKey];
   if (!cfg) return;
@@ -1372,7 +1389,7 @@ async function handleAllocate(supabase, request) {
       supabase
         .from("location")
         .select("location,client_id,location_type")
-        .eq("location", shipDock)
+        .ilike("location", shipDock)
         .ilike("location_type", "ship dock"),
     100,
     1000
@@ -1559,7 +1576,7 @@ async function handlePickOrderLoad(supabase, searchParams) {
       supabase
         .from("order_lines")
         .select(selectCols)
-        .eq(pgCol("order"), orderNum)
+        .ilike(pgCol("order"), orderNum)
         .order("line_id", { ascending: true }),
     1000,
     200000
@@ -1647,14 +1664,27 @@ async function handlePickLine(supabase, request) {
   }
   if (qty <= 0) return responseJson({ error: "qty must be greater than 0" }, 400);
 
+  const hasShipDockColumn = await tableHasColumn(supabase, "order_lines", "ship_dock");
+  const lineSelectCols = hasShipDockColumn
+    ? "\"order\",line_id,client_id,sku,qty_allocated,qty_picked,ship_dock"
+    : "\"order\",line_id,client_id,sku,qty_allocated,qty_picked";
+
   const line = await fetchOneByPk(
     supabase,
     "order_lines",
     ["order", "line_id"],
     { order: orderNum, line_id: lineId },
-    "\"order\",line_id,client_id,sku,qty_allocated,qty_picked"
+    lineSelectCols
   );
   if (!line) return responseJson({ error: `Order line '${orderNum}/${lineId}' not found` }, 404);
+
+  const shipDock = hasShipDockColumn ? String(line.ship_dock || "").trim() : "";
+  if (!shipDock) {
+    return responseJson(
+      { error: `Order line '${orderNum}/${lineId}' has no ship dock set. Allocate to a ship dock before picking.` },
+      400
+    );
+  }
 
   const alloc = intFloor(line.qty_allocated, 0);
   const picked = intFloor(line.qty_picked, 0);
@@ -1682,6 +1712,24 @@ async function handlePickLine(supabase, request) {
 
   if (!invRows.length) {
     return responseJson({ error: `No stock available at location '${location}' for SKU '${line.sku}'` }, 400);
+  }
+
+  const dockRows = await fetchAllRows(
+    () =>
+      supabase
+        .from("location")
+        .select("location,client_id,location_type")
+        .ilike("location", shipDock)
+        .eq("client_id", line.client_id)
+        .ilike("location_type", "ship dock"),
+    10,
+    100
+  );
+  if (!dockRows.length) {
+    return responseJson(
+      { error: `Ship dock '${shipDock}' is not valid for client '${line.client_id}'.` },
+      400
+    );
   }
 
   let pickableTotal = 0;
@@ -1742,6 +1790,51 @@ async function handlePickLine(supabase, request) {
     status: "Picked",
   });
 
+  const dockInvRows = await fetchAllRows(
+    () =>
+      supabase
+        .from("inventory")
+        .select("id,qty_available")
+        .eq("client_id", line.client_id)
+        .eq("sku", line.sku)
+        .ilike("location", shipDock)
+        .order("id", { ascending: true }),
+    1000,
+    200000
+  );
+
+  if (dockInvRows.length > 0) {
+    const dockRow = dockInvRows[0];
+    const nextDockAvail = intFloor(dockRow.qty_available, 0) + qty;
+    const { error: dockUpdErr } = await supabase
+      .from("inventory")
+      .update({ qty_available: nextDockAvail })
+      .eq("id", dockRow.id);
+    if (dockUpdErr) throw dockUpdErr;
+  } else {
+    const { error: dockInsErr } = await supabase.from("inventory").insert({
+      client_id: line.client_id,
+      sku: line.sku,
+      location: shipDock,
+      qty_available: qty,
+      qty_allocated: 0,
+    });
+    if (dockInsErr) throw dockInsErr;
+  }
+
+  await supabase.from("inventory_transaction").insert({
+    code: "Pick",
+    type: "Ship Dock Move",
+    client_id: line.client_id,
+    sku: line.sku,
+    location: shipDock,
+    qty,
+    order: orderNum,
+    order_line_id: lineId,
+    description: `Moved picked stock to ship dock ${shipDock}`,
+    status: "Picked",
+  });
+
   await setOrderHeaderPickedIfComplete(supabase, orderNum);
 
   return responseJson({
@@ -1752,6 +1845,7 @@ async function handlePickLine(supabase, request) {
       line_id: lineId,
       qty_allocated: alloc,
       qty_picked: newPicked,
+      ship_dock: shipDock,
     },
   });
 }
@@ -1795,8 +1889,17 @@ async function buildLocationStockSummary(supabase, location) {
 async function handleStockCheckLocation(supabase, searchParams) {
   const location = String(searchParams.get("location") || "").trim();
   if (!location) return responseJson({ error: "Missing location query parameter" }, 400);
-  const summary = await buildLocationStockSummary(supabase, location);
-  return responseJson({ location, items: summary.items });
+  const locRows = await fetchAllRows(
+    () => supabase.from("location").select("location").ilike("location", location),
+    10,
+    100
+  );
+  if (!locRows.length) {
+    return responseJson({ error: `Location '${location}' does not exist.` }, 404);
+  }
+  const canonicalLocation = locRows[0].location;
+  const summary = await buildLocationStockSummary(supabase, canonicalLocation);
+  return responseJson({ location: canonicalLocation, items: summary.items });
 }
 
 async function applyStockCheckDelta(supabase, payload) {
@@ -1967,13 +2070,17 @@ async function handleStockCheckUp(supabase, request) {
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i] || {};
     const clientId = String(row.client_id || "").trim();
-    const sku = String(row.sku || "").trim();
+    const inputSku = String(row.sku || "").trim();
     const tagId = String(row.tag_id || "").trim();
     const updateQty = intFloor(row.update_qty, 0);
 
     try {
-      if (!clientId || !sku) throw new Error("client_id and sku are required");
+      if (!clientId || !inputSku) throw new Error("client_id and sku are required");
       if (!Number.isFinite(updateQty) || updateQty <= 0) throw new Error("update_qty must be greater than 0");
+      const canonicalSku = await getCanonicalSkuForClient(supabase, clientId, inputSku);
+      if (!canonicalSku) {
+        throw new Error(`SKU '${inputSku}' does not exist for client '${clientId}'.`);
+      }
 
       let invRows = await fetchAllRows(
         () =>
@@ -1982,7 +2089,7 @@ async function handleStockCheckUp(supabase, request) {
             .select("id,qty_available,qty_allocated,suspense,tag_id")
             .eq("location", location)
             .eq("client_id", clientId)
-            .eq("sku", sku)
+            .ilike("sku", canonicalSku)
             .order("id", { ascending: true }),
         1000,
         200000
@@ -1992,7 +2099,7 @@ async function handleStockCheckUp(supabase, request) {
         const insertPayload = {
           location,
           client_id: clientId,
-          sku,
+          sku: canonicalSku,
           qty_available: 0,
           qty_allocated: 0,
         };
@@ -2009,7 +2116,7 @@ async function handleStockCheckUp(supabase, request) {
               .select("id,qty_available,qty_allocated,suspense,tag_id")
               .eq("location", location)
               .eq("client_id", clientId)
-              .eq("sku", sku)
+              .ilike("sku", canonicalSku)
               .order("id", { ascending: true }),
           1000,
           200000
@@ -2022,7 +2129,7 @@ async function handleStockCheckUp(supabase, request) {
       const nextAvail = intFloor(firstRow.qty_available, 0) + updateQty;
       const updPayload = { qty_available: nextAvail };
       if (tagId) updPayload.tag_id = tagId;
-      if (hasSuspenseCol) updPayload.suspense = intFloor(firstRow.suspense, 0) + updateQty;
+      if (hasSuspenseCol) updPayload.suspense = updateQty;
 
       const { error: updErr } = await supabase.from("inventory").update(updPayload).eq("id", firstRow.id);
       if (updErr) throw updErr;
@@ -2031,7 +2138,7 @@ async function handleStockCheckUp(supabase, request) {
         code: "Stock check",
         type: "Location Stock Check Up",
         client_id: clientId,
-        sku,
+        sku: canonicalSku,
         location,
         qty: updateQty,
         description: `Stock check up at ${location}: +${updateQty}`,

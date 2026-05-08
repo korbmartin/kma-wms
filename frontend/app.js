@@ -178,7 +178,7 @@ const HIDDEN_COLUMNS = {
 // Columns to hide from create/mass-create forms (auto-populated by backend)
 const CREATE_HIDDEN_COLUMNS = {
   order_header: ["creation_date", "creation_time", "number_of_lines"],
-  order_lines: ["creation_date", "creation_time", "line_id"],
+  order_lines: ["creation_date", "creation_time", "line_id", "qty_allocated", "qty_picked", "qty_shipped", "ship_dock"],
   pre_advice: ["creation_date", "creation_time", "number_of_lines"],
   pre_advice_lines: ["creation_date", "creation_time", "line_id"],
 };
@@ -224,6 +224,15 @@ function reorderColumns(cols) {
   if (idx > 1) {
     const [clientCol] = cols.splice(idx, 1);
     cols.splice(1, 0, clientCol);
+  }
+  if (activeTable === "inventory") {
+    const locIdx = cols.findIndex((c) => c.column_name === "location");
+    const suspIdx = cols.findIndex((c) => c.column_name === "suspense");
+    if (locIdx >= 0 && suspIdx >= 0 && suspIdx !== locIdx + 1) {
+      const [suspCol] = cols.splice(suspIdx, 1);
+      const insertAt = locIdx + 1;
+      cols.splice(insertAt, 0, suspCol);
+    }
   }
   return cols;
 }
@@ -2825,10 +2834,6 @@ async function returnToOriginAfterAction(successMessage) {
   const currentId = current ? current.id : null;
   const originId = current && current.kind === "action" ? current.originTabId : null;
 
-  if (successMessage) {
-    alert(successMessage);
-  }
-
   if (!currentId) return;
 
   const currentIdx = tabs.findIndex((t) => t.id === currentId);
@@ -2884,6 +2889,7 @@ function defaultActionState(actionKey) {
       lines: [],
       currentIndex: 0,
       resultLines: [],
+      pendingAdjustment: null,
     };
   }
   return {
@@ -3132,30 +3138,28 @@ async function renderAllocateAction() {
       const table = document.createElement("table");
       table.className = "action-table";
       const thead = document.createElement("thead");
-      thead.innerHTML = "<tr><th>Select</th><th>Order</th><th>Client</th><th>Status</th><th>Lines</th></tr>";
+      thead.innerHTML = "<tr><th>Order</th><th>Client</th><th>Status</th><th>Lines</th></tr>";
       const tbody = document.createElement("tbody");
       state.orders.forEach((row) => {
         const tr = document.createElement("tr");
         const orderNo = row.order || "";
-        tr.innerHTML = `<td></td><td>${orderNo}</td><td>${row.client_id || ""}</td><td>${row.status || ""}</td><td>${row.number_of_lines || 0}</td>`;
-        const cb = document.createElement("input");
-        cb.type = "checkbox";
-        cb.checked = state.selectedOrders.includes(orderNo);
-        cb.addEventListener("change", () => {
-          if (cb.checked) {
-            if (!state.selectedOrders.includes(orderNo)) state.selectedOrders.push(orderNo);
-          } else {
-            state.selectedOrders = state.selectedOrders.filter((o) => o !== orderNo);
-          }
-          setActiveActionState(state);
-        });
-        tr.children[0].appendChild(cb);
+        tr.setAttribute("data-row-key", orderNo);
+        if (state.selectedOrders.includes(orderNo)) tr.classList.add("selected");
+        tr.innerHTML = `<td>${orderNo}</td><td>${row.client_id || ""}</td><td>${row.status || ""}</td><td>${row.number_of_lines || 0}</td>`;
         tbody.appendChild(tr);
       });
       table.appendChild(thead);
       table.appendChild(tbody);
       wrap.appendChild(table);
       resultsCard.appendChild(wrap);
+      const selectionHint = document.createElement("p");
+      selectionHint.className = "query-hint";
+      selectionHint.textContent = "Select orders using click / Ctrl+click / Shift+click / drag.";
+      resultsCard.appendChild(selectionHint);
+      attachGridSelection(tbody, (selectedKeys) => {
+        state.selectedOrders = selectedKeys;
+        setActiveActionState(state);
+      });
 
       const nextRow = document.createElement("div");
       nextRow.className = "action-row";
@@ -3471,7 +3475,76 @@ async function renderPickAction() {
 
     const nav = document.createElement("div");
     nav.className = "action-row";
+
+    if (state.pendingAdjustment) {
+      const adjCard = document.createElement("div");
+      adjCard.className = "action-card";
+      const adjTitle = document.createElement("div");
+      adjTitle.className = "action-step-title";
+      adjTitle.textContent = `Location ${state.pendingAdjustment.location} now shows 0 in system. Any more stock there?`;
+      adjCard.appendChild(adjTitle);
+
+      const adjRow = document.createElement("div");
+      adjRow.className = "action-row";
+
+      const qtyField = document.createElement("div");
+      qtyField.className = "query-field";
+      const qtyLabel = document.createElement("label");
+      qtyLabel.textContent = "Counted Qty (if Yes)";
+      const qtyInput = document.createElement("input");
+      qtyInput.type = "number";
+      qtyInput.min = "0";
+      qtyInput.value = state.pendingAdjustment.counted_qty || "0";
+      qtyInput.addEventListener("input", () => {
+        state.pendingAdjustment.counted_qty = qtyInput.value;
+        setActiveActionState(state);
+      });
+      qtyField.appendChild(qtyLabel);
+      qtyField.appendChild(qtyInput);
+      adjRow.appendChild(qtyField);
+      adjCard.appendChild(adjRow);
+
+      const adjBtns = document.createElement("div");
+      adjBtns.className = "action-row";
+      adjBtns.appendChild(makeActionButton("No, Continue", "btn-secondary", async () => {
+        state.pendingAdjustment = null;
+        state.currentIndex += 1;
+        setActiveActionState(state);
+        await renderPickAction();
+      }));
+      adjBtns.appendChild(makeActionButton("Yes, Update Stock", "btn-create", async () => {
+        const countedQty = Number(state.pendingAdjustment.counted_qty || 0);
+        if (!Number.isFinite(countedQty) || countedQty < 0) {
+          setActionStatus("Enter a valid counted qty (0 or higher).", "error");
+          return;
+        }
+        try {
+          const adjRes = await fetch(`${API_BASE}/actions/pick/stock-adjust`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              location: state.pendingAdjustment.location,
+              client_id: state.pendingAdjustment.client_id,
+              sku: state.pendingAdjustment.sku,
+              counted_qty: countedQty,
+            }),
+          });
+          const adj = await adjRes.json();
+          if (!adjRes.ok) throw new Error(adj.error || "Stock adjustment failed");
+          state.pendingAdjustment = null;
+          state.currentIndex += 1;
+          setActiveActionState(state);
+          await renderPickAction();
+        } catch (err) {
+          setActionStatus(err.message || "Stock adjustment failed", "error");
+        }
+      }));
+      adjCard.appendChild(adjBtns);
+      actionBody.appendChild(adjCard);
+    }
+
     nav.appendChild(makeActionButton("Pick and Next", "btn-create", async () => {
+      if (state.pendingAdjustment) return;
       const location = locSelect.value;
       const qty = Number(qtyInput.value || 0);
       if (!location) {
@@ -3496,30 +3569,17 @@ async function renderPickAction() {
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || "Pick failed");
 
-        if (Number(data.location_qty_after || 0) <= 0) {
-          const hasMore = confirm(`System now shows 0 left in ${location}. Is there still stock in that location?`);
-          if (hasMore) {
-            const raw = prompt("Enter counted qty left in location:", "0");
-            const countedQty = Number(raw || 0);
-            if (Number.isFinite(countedQty) && countedQty >= 0) {
-              const adjRes = await fetch(`${API_BASE}/actions/pick/stock-adjust`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                  location,
-                  client_id: line.client_id,
-                  sku: line.sku,
-                  counted_qty: countedQty,
-                }),
-              });
-              const adj = await adjRes.json();
-              if (!adjRes.ok) throw new Error(adj.error || "Stock adjustment failed");
-            }
-          }
-        }
-
         state.resultLines.push(`Order ${line.order} line ${line.line_id}: picked ${qty} from ${location}`);
-        state.currentIndex += 1;
+        if (Number(data.location_qty_after || 0) <= 0) {
+          state.pendingAdjustment = {
+            location,
+            client_id: line.client_id,
+            sku: line.sku,
+            counted_qty: "0",
+          };
+        } else {
+          state.currentIndex += 1;
+        }
         setActiveActionState(state);
         await renderPickAction();
       } catch (err) {
@@ -3702,9 +3762,17 @@ async function renderStockCheckAction() {
         });
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || "Stock check up failed");
-        await returnToOriginAfterAction(`Stock check up applied. Updated ${data.updated || 0} row(s).`);
+        if (Array.isArray(data.errors) && data.errors.length > 0) {
+          const lines = data.errors.map((e) => ({
+            text: `Row ${e.row || "?"}: ${e.error || "Unknown error"}`,
+            type: "error",
+          }));
+          showMassResult(lines);
+          return;
+        }
+        await renderActionTab("stock_check", null);
       } catch (err) {
-        setActionStatus(err.message || "Stock check up failed", "error");
+        showMassResult([{ text: err.message || "Stock check up failed", type: "error" }]);
       }
     }));
     card.appendChild(upActions);
@@ -3762,9 +3830,17 @@ async function renderStockCheckAction() {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Stock check failed");
-      await returnToOriginAfterAction(`Stock check applied. Adjusted ${data.updated || 0} SKU row(s).`);
+      if (Array.isArray(data.errors) && data.errors.length > 0) {
+        const lines = data.errors.map((e) => ({
+          text: `Row ${e.row || "?"}: ${e.error || "Unknown error"}`,
+          type: "error",
+        }));
+        showMassResult(lines);
+        return;
+      }
+      await renderActionTab("stock_check", null);
     } catch (err) {
-      setActionStatus(err.message || "Stock check failed", "error");
+      showMassResult([{ text: err.message || "Stock check failed", type: "error" }]);
     }
     }));
   }
