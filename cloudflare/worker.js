@@ -1277,9 +1277,6 @@ async function handleAllocateSearchOrders(supabase, searchParams) {
     .from("order_header")
     .select("\"order\",client_id,status,number_of_lines", { count: "exact" });
 
-  // Allocate flow only works with orders that are Ready.
-  query = query.eq("status", "Ready");
-
   for (const [key, value] of searchParams.entries()) {
     if (!isValidColumnName(key)) continue;
     const v = String(value || "").trim();
@@ -1290,7 +1287,45 @@ async function handleAllocateSearchOrders(supabase, searchParams) {
   query = query.range(0, 499);
   const { data, error } = await query;
   if (error) throw error;
-  return responseJson({ rows: data || [] });
+
+  const orders = data || [];
+  if (!orders.length) return responseJson({ rows: [] });
+
+  const orderIds = Array.from(new Set(orders.map((o) => o.order).filter(Boolean)));
+  const chunks = chunkArray(orderIds, 200);
+  const hasUnallocatedByOrder = new Map();
+
+  for (const chunk of chunks) {
+    const lineRows = await fetchAllRows(
+      () =>
+        supabase
+          .from("order_lines")
+          .select("\"order\",qty_ordered,qty_allocated")
+          .in(pgCol("order"), chunk),
+      1000,
+      200000
+    );
+
+    for (const line of lineRows) {
+      const orderNum = line.order;
+      if (!orderNum) continue;
+      const qtyOrdered = intFloor(line.qty_ordered, 0);
+      const qtyAllocated = intFloor(line.qty_allocated, 0);
+      if (qtyAllocated < qtyOrdered) {
+        hasUnallocatedByOrder.set(orderNum, true);
+      } else if (!hasUnallocatedByOrder.has(orderNum)) {
+        hasUnallocatedByOrder.set(orderNum, false);
+      }
+    }
+  }
+
+  const filtered = orders.filter((order) => {
+    const statusReady = String(order.status || "").toLowerCase() === "ready";
+    const hasUnallocated = hasUnallocatedByOrder.get(order.order) === true;
+    return statusReady || hasUnallocated;
+  });
+
+  return responseJson({ rows: filtered });
 }
 
 async function handleAllocateLines(supabase, searchParams) {
