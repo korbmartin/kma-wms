@@ -3429,7 +3429,7 @@ async function renderPickAction() {
 
   if (state.step === 2) {
     if (!state.lines.length || state.currentIndex >= state.lines.length) {
-      await returnToOriginAfterAction("Pick workflow completed successfully.");
+      await renderActionTab("pick", null);
       return;
     }
 
@@ -3591,7 +3591,7 @@ async function renderPickAction() {
     return;
   }
 
-  await returnToOriginAfterAction("Pick workflow completed successfully.");
+  await renderActionTab("pick", null);
 }
 
 async function renderStockCheckAction() {

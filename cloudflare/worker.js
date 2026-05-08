@@ -493,6 +493,26 @@ async function getCanonicalSkuForClient(supabase, clientId, sku) {
   return rows.length > 0 ? rows[0].sku : null;
 }
 
+async function getShipDockLocationSetForClient(supabase, clientId) {
+  const client = String(clientId || "").trim();
+  if (!client) return new Set();
+  const rows = await fetchAllRows(
+    () =>
+      supabase
+        .from("location")
+        .select("location")
+        .eq("client_id", client)
+        .ilike("location_type", "ship dock"),
+    1000,
+    200000
+  );
+  const set = new Set();
+  for (const row of rows) {
+    if (row.location) set.add(String(row.location).toLowerCase());
+  }
+  return set;
+}
+
 async function logStatusChange(supabase, tableKey, pkValues) {
   const cfg = STATUS_LOG_FIELDS[tableKey];
   if (!cfg) return;
@@ -1320,6 +1340,8 @@ async function handleAllocateSearchOrders(supabase, searchParams) {
   }
 
   const filtered = orders.filter((order) => {
+    const statusLower = String(order.status || "").toLowerCase();
+    if (statusLower === "locked") return false;
     const statusReady = String(order.status || "").toLowerCase() === "ready";
     const hasUnallocated = hasUnallocatedByOrder.get(order.order) === true;
     return statusReady || hasUnallocated;
@@ -1622,6 +1644,7 @@ async function handlePickOrderLoad(supabase, searchParams) {
   }
 
   const resultLines = [];
+  const shipDockSetByClient = new Map();
   for (const line of lines) {
     const qtyOrdered = intFloor(line.qty_ordered, 0);
     const qtyAllocated = intFloor(line.qty_allocated, 0);
@@ -1641,6 +1664,17 @@ async function handlePickOrderLoad(supabase, searchParams) {
       200000
     );
 
+    let shipDockSet = shipDockSetByClient.get(line.client_id);
+    if (!shipDockSet) {
+      shipDockSet = await getShipDockLocationSetForClient(supabase, line.client_id);
+      shipDockSetByClient.set(line.client_id, shipDockSet);
+    }
+
+    const filteredLocations = (locations || []).filter((loc) => {
+      const locName = String(loc.location || "").toLowerCase();
+      return !shipDockSet.has(locName);
+    });
+
     resultLines.push({
       ...line,
       ship_dock: hasShipDockColumn ? line.ship_dock : null,
@@ -1648,7 +1682,7 @@ async function handlePickOrderLoad(supabase, searchParams) {
       qty_allocated: qtyAllocated,
       qty_picked: qtyPicked,
       remaining_to_pick: remainingToPick,
-      locations: (locations || []).map((loc) => ({
+      locations: filteredLocations.map((loc) => ({
         location: loc.location,
         qty_available: intFloor(loc.qty_available, 0),
         qty_allocated: intFloor(loc.qty_allocated, 0),
@@ -1717,6 +1751,24 @@ async function handlePickLine(supabase, request) {
   if (!shipDock) {
     return responseJson(
       { error: `Order line '${orderNum}/${lineId}' has no ship dock set. Allocate to a ship dock before picking.` },
+      400
+    );
+  }
+
+  const sourceIsShipDockRows = await fetchAllRows(
+    () =>
+      supabase
+        .from("location")
+        .select("location")
+        .eq("client_id", line.client_id)
+        .ilike("location", location)
+        .ilike("location_type", "ship dock"),
+    10,
+    100
+  );
+  if (sourceIsShipDockRows.length > 0) {
+    return responseJson(
+      { error: `Location '${location}' is a ship dock and cannot be used as a pick source.` },
       400
     );
   }
