@@ -1992,28 +1992,63 @@ async function handleStockCheckLocation(supabase, searchParams) {
 async function applyStockCheckDelta(supabase, payload) {
   const location = String(payload?.location || "").trim();
   const clientId = String(payload?.client_id || "").trim();
-  const sku = String(payload?.sku || "").trim();
+  const inputSku = String(payload?.sku || "").trim();
   const countedQty = intFloor(payload?.counted_qty, 0);
 
-  if (!location || !clientId || !sku) {
+  if (!location || !clientId || !inputSku) {
     throw new Error("location, client_id and sku are required");
   }
   if (countedQty < 0) throw new Error("counted_qty cannot be negative");
 
-  const invRows = await fetchAllRows(
+  const canonicalSku = await getCanonicalSkuForClient(supabase, clientId, inputSku);
+  if (!canonicalSku) {
+    throw new Error(`SKU '${inputSku}' does not exist for client '${clientId}'.`);
+  }
+
+  const hasSuspenseCol = await tableHasColumn(supabase, "inventory", "suspense");
+  if (!hasSuspenseCol) {
+    throw new Error("inventory.suspense column is missing. Run db/add_action_columns.sql in Supabase.");
+  }
+
+  let invRows = await fetchAllRows(
     () =>
       supabase
         .from("inventory")
         .select("id,client_id,sku,location,qty_available,qty_allocated,suspense")
         .eq("location", location)
         .eq("client_id", clientId)
-        .eq("sku", sku)
+        .ilike("sku", canonicalSku)
         .order("id", { ascending: true }),
     1000,
     200000
   );
 
-  if (!invRows.length) throw new Error(`No inventory row found for ${clientId}/${sku} at ${location}`);
+  if (!invRows.length) {
+    const { error: insErr } = await supabase.from("inventory").insert({
+      location,
+      client_id: clientId,
+      sku: canonicalSku,
+      qty_available: 0,
+      qty_allocated: 0,
+      suspense: 0,
+    });
+    if (insErr) throw insErr;
+
+    invRows = await fetchAllRows(
+      () =>
+        supabase
+          .from("inventory")
+          .select("id,client_id,sku,location,qty_available,qty_allocated,suspense")
+          .eq("location", location)
+          .eq("client_id", clientId)
+          .ilike("sku", canonicalSku)
+          .order("id", { ascending: true }),
+      1000,
+      200000
+    );
+  }
+
+  if (!invRows.length) throw new Error(`No inventory row found for ${clientId}/${canonicalSku} at ${location}`);
 
   let totalAvail = 0;
   let totalAlloc = 0;
@@ -2028,11 +2063,6 @@ async function applyStockCheckDelta(supabase, payload) {
   const nextSuspense = previousSuspense + delta;
   const newAllocTotal = Math.min(totalAlloc, countedQty);
   const newAvailTotal = countedQty - newAllocTotal;
-
-  const hasSuspenseCol = await tableHasColumn(supabase, "inventory", "suspense");
-  if (!hasSuspenseCol) {
-    throw new Error("inventory.suspense column is missing. Run db/add_action_columns.sql in Supabase.");
-  }
 
   let remAlloc = newAllocTotal;
   let remAvail = newAvailTotal;
@@ -2073,7 +2103,7 @@ async function applyStockCheckDelta(supabase, payload) {
     code: "Stock check",
     type: "Location Stock Check",
     client_id: clientId,
-    sku,
+    sku: canonicalSku,
     location,
     qty: countedQty,
     description: `Stock check at ${location}: system ${currentQty}, counted ${countedQty}, delta ${delta >= 0 ? "+" : ""}${delta}`,
@@ -2083,7 +2113,7 @@ async function applyStockCheckDelta(supabase, payload) {
   const { error: txErr } = await supabase.from("inventory_transaction").insert(txnPayload);
   if (txErr) throw txErr;
 
-  return { location, client_id: clientId, sku, current_qty: currentQty, counted_qty: countedQty, delta };
+  return { location, client_id: clientId, sku: canonicalSku, current_qty: currentQty, counted_qty: countedQty, delta };
 }
 
 async function handlePickStockAdjust(supabase, request) {

@@ -2898,6 +2898,9 @@ function defaultActionState(actionKey) {
     locationB: "",
     items: [],
     countedByKey: {},
+    stockCheckRows: [],
+    stockCheckClientOptions: [],
+    stockCheckSystemByKey: {},
     stockUpRows: [{ client_id: "", sku: "", update_qty: "", tag_id: "" }],
     stockUpClientOptions: [],
   };
@@ -3626,11 +3629,21 @@ async function renderStockCheckAction() {
         const res = await fetch(`${API_BASE}/actions/stock-check/location?location=${encodeURIComponent(state.locationA)}`);
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || "Failed to load location stock");
+        state.locationA = data.location || state.locationA;
         state.items = data.items || [];
         state.countedByKey = {};
+        state.stockCheckSystemByKey = {};
+        state.stockCheckRows = [];
+        state.stockCheckClientOptions = await getDropdownOptions("clients", "client_id");
         state.items.forEach((item) => {
           const key = `${item.client_id}::${item.sku}`;
           state.countedByKey[key] = String(item.current_qty || 0);
+          state.stockCheckSystemByKey[key] = Number(item.current_qty || 0);
+          state.stockCheckRows.push({
+            client_id: item.client_id || "",
+            sku: item.sku || "",
+            counted_qty: String(item.current_qty || 0),
+          });
         });
         if (!state.items.length) {
           state.stockUpClientOptions = await getDropdownOptions("clients", "client_id");
@@ -3781,25 +3794,72 @@ async function renderStockCheckAction() {
     wrap.className = "action-table-wrap";
     const table = document.createElement("table");
     table.className = "action-table";
-    table.innerHTML = "<thead><tr><th>Client</th><th>SKU</th><th>System Qty</th><th>Counted Qty</th></tr></thead>";
+    table.innerHTML = "<thead><tr><th>Client</th><th>Found SKU</th><th>System Qty</th><th>Counted Qty</th></tr></thead>";
     const tbody = document.createElement("tbody");
-    state.items.forEach((item) => {
-      const key = `${item.client_id}::${item.sku}`;
+    (state.stockCheckRows || []).forEach((row, idx) => {
+      const key = `${row.client_id || ""}::${row.sku || ""}`;
+      const systemQty = Number((state.stockCheckSystemByKey && state.stockCheckSystemByKey[key]) || 0);
       const tr = document.createElement("tr");
-      tr.innerHTML = `<td>${item.client_id || ""}</td><td>${item.sku || ""}</td><td>${item.current_qty || 0}</td><td></td>`;
-      const input = document.createElement("input");
-      input.type = "number";
-      input.value = state.countedByKey[key] || "0";
-      input.addEventListener("input", () => {
-        state.countedByKey[key] = input.value;
+      tr.innerHTML = "<td></td><td></td><td></td><td></td>";
+
+      const tdClient = tr.children[0];
+      const clientSel = document.createElement("select");
+      const clientEmpty = document.createElement("option");
+      clientEmpty.value = "";
+      clientEmpty.textContent = "— Select —";
+      clientSel.appendChild(clientEmpty);
+      (state.stockCheckClientOptions || []).forEach((clientId) => {
+        const opt = document.createElement("option");
+        opt.value = clientId;
+        opt.textContent = clientId;
+        if (row.client_id === clientId) opt.selected = true;
+        clientSel.appendChild(opt);
+      });
+      clientSel.addEventListener("change", () => {
+        state.stockCheckRows[idx].client_id = clientSel.value;
+        setActiveActionState(state);
+        renderStockCheckAction();
+      });
+      tdClient.appendChild(clientSel);
+
+      const tdSku = tr.children[1];
+      const skuInput = document.createElement("input");
+      skuInput.type = "text";
+      skuInput.value = row.sku || "";
+      skuInput.addEventListener("input", () => {
+        state.stockCheckRows[idx].sku = skuInput.value.trim();
+        setActiveActionState(state);
+        renderStockCheckAction();
+      });
+      tdSku.appendChild(skuInput);
+
+      const tdSystem = tr.children[2];
+      tdSystem.textContent = String(systemQty);
+
+      const tdCounted = tr.children[3];
+      const countedInput = document.createElement("input");
+      countedInput.type = "number";
+      countedInput.min = "0";
+      countedInput.value = row.counted_qty || "0";
+      countedInput.addEventListener("input", () => {
+        state.stockCheckRows[idx].counted_qty = countedInput.value;
         setActiveActionState(state);
       });
-      tr.children[3].appendChild(input);
+      tdCounted.appendChild(countedInput);
       tbody.appendChild(tr);
     });
     table.appendChild(tbody);
     wrap.appendChild(table);
     card.appendChild(wrap);
+
+    const addRowWrap = document.createElement("div");
+    addRowWrap.className = "action-row";
+    addRowWrap.appendChild(makeActionButton("+ Add Found SKU", "btn-secondary", async () => {
+      state.stockCheckRows.push({ client_id: "", sku: "", counted_qty: "0" });
+      setActiveActionState(state);
+      await renderStockCheckAction();
+    }));
+    card.appendChild(addRowWrap);
   }
 
   const nav = document.createElement("div");
@@ -3811,14 +3871,25 @@ async function renderStockCheckAction() {
   }));
   if (state.items.length) {
     nav.appendChild(makeActionButton("Apply Stock Check", "btn-create", async () => {
-    const counts = state.items.map((item) => {
-      const key = `${item.client_id}::${item.sku}`;
-      return {
-        client_id: item.client_id,
-        sku: item.sku,
-        counted_qty: Number(state.countedByKey[key] || 0),
-      };
-    });
+    const counts = (state.stockCheckRows || [])
+      .map((row) => ({
+        client_id: String(row.client_id || "").trim(),
+        sku: String(row.sku || "").trim(),
+        counted_qty: Number(row.counted_qty || 0),
+      }))
+      .filter((row) => row.client_id || row.sku || Number(row.counted_qty || 0) > 0);
+
+    if (!counts.length) {
+      showMassResult([{ text: "Add at least one stock-check row.", type: "error" }]);
+      return;
+    }
+
+    const invalid = counts.find((row) => !row.client_id || !row.sku || !Number.isFinite(row.counted_qty) || row.counted_qty < 0);
+    if (invalid) {
+      showMassResult([{ text: "Each stock-check row needs client, found SKU, and counted qty (0 or more).", type: "error" }]);
+      return;
+    }
+
     try {
       const res = await fetch(`${API_BASE}/actions/stock-check`, {
         method: "POST",
