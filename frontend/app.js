@@ -82,6 +82,7 @@ const importRowCount = document.getElementById("importRowCount");
 const importStatus = document.getElementById("importStatus");
 const importTemplateBtn = document.getElementById("importTemplateBtn");
 const menuImport = document.getElementById("menuImport");
+const menuActions = document.getElementById("menuActions");
 const kpiNavBtn = document.getElementById("kpiNavBtn");
 const kpiPage = document.getElementById("kpiPage");
 const kpiMonth = document.getElementById("kpiMonth");
@@ -2753,7 +2754,7 @@ menuImport.querySelectorAll("button[data-import]").forEach((btn) => {
     openImport(btn.dataset.import);
   });
 });
-menuImport.querySelectorAll("button[data-action]").forEach((btn) => {
+menuActions.querySelectorAll("button[data-action]").forEach((btn) => {
   btn.addEventListener("click", async (e) => {
     e.stopPropagation();
     document.querySelectorAll(".nav-dropdown").forEach((d) => d.classList.remove("open"));
@@ -2856,6 +2857,8 @@ function defaultActionState(actionKey) {
     locationB: "",
     items: [],
     countedByKey: {},
+    stockUpRows: [{ client_id: "", sku: "", update_qty: "", tag_id: "" }],
+    stockUpClientOptions: [],
   };
 }
 
@@ -2870,6 +2873,115 @@ async function getAllocateFilterColumns() {
 function parseLineKey(key) {
   const parts = String(key || "").split("::");
   return { order: parts[0] || "", line_id: parts[1] || "" };
+}
+
+function rowSelectionSetFromTbody(tbody, rowKeyAttr = "data-row-key") {
+  const selected = [];
+  tbody.querySelectorAll("tr.selected").forEach((tr) => {
+    const key = tr.getAttribute(rowKeyAttr);
+    if (key) selected.push(key);
+  });
+  return selected;
+}
+
+function attachGridSelection(tbody, onChange) {
+  let isDraggingLocal = false;
+  let dragStartIdxLocal = null;
+  let dragMovedLocal = false;
+  let dragCtrlLocal = false;
+  let dragDeselectLocal = false;
+  let preDragLocal = new Set();
+  let lastClickedLocal = null;
+
+  const getRows = () => Array.from(tbody.querySelectorAll("tr"));
+  const emit = () => {
+    if (typeof onChange === "function") onChange(rowSelectionSetFromTbody(tbody));
+  };
+
+  const applyDrag = (idx) => {
+    const rows = getRows();
+    const start = Math.min(dragStartIdxLocal, idx);
+    const end = Math.max(dragStartIdxLocal, idx);
+    if (dragDeselectLocal) {
+      rows.forEach((r, i) => {
+        if (i >= start && i <= end) r.classList.remove("selected");
+        else if (preDragLocal.has(i)) r.classList.add("selected");
+      });
+    } else {
+      rows.forEach((r, i) => {
+        if (i >= start && i <= end) r.classList.add("selected");
+        else if (dragCtrlLocal && preDragLocal.has(i)) r.classList.add("selected");
+        else if (!dragCtrlLocal) r.classList.remove("selected");
+      });
+    }
+    emit();
+  };
+
+  tbody.addEventListener("mousedown", (e) => {
+    if (e.button !== 0) return;
+    if (e.target.closest("input,button,select")) return;
+    const tr = e.target.closest("tr");
+    if (!tr || !tbody.contains(tr)) return;
+    const rows = getRows();
+    const idx = rows.indexOf(tr);
+    if (idx < 0) return;
+    isDraggingLocal = true;
+    dragStartIdxLocal = idx;
+    dragMovedLocal = false;
+    dragCtrlLocal = e.ctrlKey;
+    dragDeselectLocal = tr.classList.contains("selected");
+    preDragLocal = new Set();
+    rows.forEach((r, i) => {
+      if (r.classList.contains("selected")) preDragLocal.add(i);
+    });
+  });
+
+  tbody.addEventListener("mousemove", (e) => {
+    if (!isDraggingLocal) return;
+    const tr = e.target.closest("tr");
+    if (!tr || !tbody.contains(tr)) return;
+    const rows = getRows();
+    const idx = rows.indexOf(tr);
+    if (idx < 0 || idx === dragStartIdxLocal) return;
+    dragMovedLocal = true;
+    applyDrag(idx);
+  });
+
+  document.addEventListener("mouseup", () => {
+    if (!isDraggingLocal) return;
+    isDraggingLocal = false;
+    if (dragMovedLocal) {
+      const rows = getRows();
+      const selected = rows.filter((r) => r.classList.contains("selected"));
+      if (selected.length > 0) lastClickedLocal = rows.indexOf(selected[selected.length - 1]);
+    }
+  });
+
+  tbody.addEventListener("click", (e) => {
+    const tr = e.target.closest("tr");
+    if (!tr || !tbody.contains(tr)) return;
+    if (e.target.closest("input,button,select")) return;
+    if (dragMovedLocal) return;
+
+    const rows = getRows();
+    const idx = rows.indexOf(tr);
+    if (idx < 0) return;
+
+    if (e.shiftKey && lastClickedLocal !== null) {
+      if (!e.ctrlKey) rows.forEach((r) => r.classList.remove("selected"));
+      const start = Math.min(lastClickedLocal, idx);
+      const end = Math.max(lastClickedLocal, idx);
+      for (let i = start; i <= end; i++) rows[i].classList.add("selected");
+    } else if (e.ctrlKey) {
+      tr.classList.toggle("selected");
+      lastClickedLocal = idx;
+    } else {
+      rows.forEach((r) => r.classList.remove("selected"));
+      tr.classList.add("selected");
+      lastClickedLocal = idx;
+    }
+    emit();
+  });
 }
 
 function makeActionCard(titleText) {
@@ -3050,24 +3162,14 @@ async function renderAllocateAction() {
     wrap.className = "action-table-wrap";
     const table = document.createElement("table");
     table.className = "action-table";
-    table.innerHTML = "<thead><tr><th>Select</th><th>Order</th><th>Line</th><th>Client</th><th>SKU</th><th>Qty Ordered</th><th>Qty Allocated</th><th>Qty Remaining</th><th>Qty To Allocate</th></tr></thead>";
+    table.innerHTML = "<thead><tr><th>Order</th><th>Line</th><th>Client</th><th>SKU</th><th>Qty Ordered</th><th>Qty Allocated</th><th>Qty Remaining</th><th>Qty To Allocate</th></tr></thead>";
     const tbody = document.createElement("tbody");
     state.lines.forEach((line) => {
       const key = `${line.order}::${line.line_id}`;
       const tr = document.createElement("tr");
-      tr.innerHTML = `<td></td><td>${line.order || ""}</td><td>${line.line_id || ""}</td><td>${line.client_id || ""}</td><td>${line.sku || ""}</td><td>${line.qty_ordered || 0}</td><td>${line.qty_allocated || 0}</td><td>${line.qty_remaining || 0}</td><td></td>`;
-      const cb = document.createElement("input");
-      cb.type = "checkbox";
-      cb.checked = state.selectedLines.includes(key);
-      cb.addEventListener("change", () => {
-        if (cb.checked) {
-          if (!state.selectedLines.includes(key)) state.selectedLines.push(key);
-        } else {
-          state.selectedLines = state.selectedLines.filter((k) => k !== key);
-        }
-        setActiveActionState(state);
-      });
-      tr.children[0].appendChild(cb);
+      tr.setAttribute("data-row-key", key);
+      if (state.selectedLines.includes(key)) tr.classList.add("selected");
+      tr.innerHTML = `<td>${line.order || ""}</td><td>${line.line_id || ""}</td><td>${line.client_id || ""}</td><td>${line.sku || ""}</td><td>${line.qty_ordered || 0}</td><td>${line.qty_allocated || 0}</td><td>${line.qty_remaining || 0}</td><td></td>`;
 
       const qtyInput = document.createElement("input");
       qtyInput.type = "number";
@@ -3077,12 +3179,20 @@ async function renderAllocateAction() {
         state.qtyByLine[key] = qtyInput.value;
         setActiveActionState(state);
       });
-      tr.children[8].appendChild(qtyInput);
+      tr.children[7].appendChild(qtyInput);
       tbody.appendChild(tr);
     });
     table.appendChild(tbody);
     wrap.appendChild(table);
     linesCard.appendChild(wrap);
+    const selectionHint = document.createElement("p");
+    selectionHint.className = "query-hint";
+    selectionHint.textContent = "Select lines using click / Ctrl+click / Shift+click / drag, same as data tables.";
+    linesCard.appendChild(selectionHint);
+    attachGridSelection(tbody, (selectedKeys) => {
+      state.selectedLines = selectedKeys;
+      setActiveActionState(state);
+    });
 
     const nav = document.createElement("div");
     nav.className = "action-row";
@@ -3403,6 +3513,10 @@ async function renderStockCheckAction() {
           const key = `${item.client_id}::${item.sku}`;
           state.countedByKey[key] = String(item.current_qty || 0);
         });
+        if (!state.items.length) {
+          state.stockUpClientOptions = await getDropdownOptions("clients", "client_id");
+          state.stockUpRows = [{ client_id: "", sku: "", update_qty: "", tag_id: "" }];
+        }
         state.step = 2;
         setActiveActionState(state);
         await renderStockCheckAction();
@@ -3418,8 +3532,123 @@ async function renderStockCheckAction() {
   const card = makeActionCard(`Step 2: Counted Qty at ${state.locationA}`);
   if (!state.items.length) {
     const empty = document.createElement("p");
-    empty.textContent = "No SKU currently recorded in this location.";
+    empty.textContent = "Location is empty in system. Add stock check-up rows below.";
     card.appendChild(empty);
+
+    const upWrap = document.createElement("div");
+    upWrap.className = "action-table-wrap";
+    const upTable = document.createElement("table");
+    upTable.className = "action-table";
+    upTable.innerHTML = "<thead><tr><th>Client ID *</th><th>SKU *</th><th>Update Qty *</th><th>Tag ID (optional)</th></tr></thead>";
+    const upBody = document.createElement("tbody");
+    state.stockUpRows.forEach((row, idx) => {
+      const tr = document.createElement("tr");
+
+      const tdClient = document.createElement("td");
+      const sel = document.createElement("select");
+      const emptyOpt = document.createElement("option");
+      emptyOpt.value = "";
+      emptyOpt.textContent = "— Select —";
+      sel.appendChild(emptyOpt);
+      (state.stockUpClientOptions || []).forEach((clientId) => {
+        const opt = document.createElement("option");
+        opt.value = clientId;
+        opt.textContent = clientId;
+        if (row.client_id === clientId) opt.selected = true;
+        sel.appendChild(opt);
+      });
+      sel.addEventListener("change", () => {
+        state.stockUpRows[idx].client_id = sel.value;
+        setActiveActionState(state);
+      });
+      tdClient.appendChild(sel);
+
+      const tdSku = document.createElement("td");
+      const skuInput = document.createElement("input");
+      skuInput.type = "text";
+      skuInput.value = row.sku || "";
+      skuInput.addEventListener("input", () => {
+        state.stockUpRows[idx].sku = skuInput.value.trim();
+        setActiveActionState(state);
+      });
+      tdSku.appendChild(skuInput);
+
+      const tdQty = document.createElement("td");
+      const qtyInput = document.createElement("input");
+      qtyInput.type = "number";
+      qtyInput.min = "1";
+      qtyInput.value = row.update_qty || "";
+      qtyInput.addEventListener("input", () => {
+        state.stockUpRows[idx].update_qty = qtyInput.value;
+        setActiveActionState(state);
+      });
+      tdQty.appendChild(qtyInput);
+
+      const tdTag = document.createElement("td");
+      const tagInput = document.createElement("input");
+      tagInput.type = "text";
+      tagInput.value = row.tag_id || "";
+      tagInput.addEventListener("input", () => {
+        state.stockUpRows[idx].tag_id = tagInput.value.trim();
+        setActiveActionState(state);
+      });
+      tdTag.appendChild(tagInput);
+
+      tr.appendChild(tdClient);
+      tr.appendChild(tdSku);
+      tr.appendChild(tdQty);
+      tr.appendChild(tdTag);
+      upBody.appendChild(tr);
+    });
+    upTable.appendChild(upBody);
+    upWrap.appendChild(upTable);
+    card.appendChild(upWrap);
+
+    const upActions = document.createElement("div");
+    upActions.className = "action-row";
+    upActions.appendChild(makeActionButton("+ Add Row", "btn-secondary", async () => {
+      state.stockUpRows.push({ client_id: "", sku: "", update_qty: "", tag_id: "" });
+      setActiveActionState(state);
+      await renderStockCheckAction();
+    }));
+    upActions.appendChild(makeActionButton("Apply Stock Check Up", "btn-create", async () => {
+      const rows = (state.stockUpRows || [])
+        .map((r) => ({
+          client_id: String(r.client_id || "").trim(),
+          sku: String(r.sku || "").trim(),
+          update_qty: Number(r.update_qty || 0),
+          tag_id: String(r.tag_id || "").trim(),
+        }))
+        .filter((r) => r.client_id || r.sku || r.update_qty > 0 || r.tag_id);
+
+      if (!rows.length) {
+        setActionStatus("Add at least one row for stock check up.", "error");
+        return;
+      }
+
+      const invalid = rows.find((r) => !r.client_id || !r.sku || !Number.isFinite(r.update_qty) || r.update_qty <= 0);
+      if (invalid) {
+        setActionStatus("Each row needs client ID, SKU, and update qty > 0.", "error");
+        return;
+      }
+
+      try {
+        const res = await fetch(`${API_BASE}/actions/stock-check-up`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            location: state.locationA,
+            rows,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || "Stock check up failed");
+        setActionStatus(`Stock check up applied. Updated ${data.updated || 0} row(s).`, "success");
+      } catch (err) {
+        setActionStatus(err.message || "Stock check up failed", "error");
+      }
+    }));
+    card.appendChild(upActions);
   } else {
     const wrap = document.createElement("div");
     wrap.className = "action-table-wrap";
@@ -3453,7 +3682,8 @@ async function renderStockCheckAction() {
     setActiveActionState(state);
     await renderStockCheckAction();
   }));
-  nav.appendChild(makeActionButton("Apply Stock Check", "btn-create", async () => {
+  if (state.items.length) {
+    nav.appendChild(makeActionButton("Apply Stock Check", "btn-create", async () => {
     const counts = state.items.map((item) => {
       const key = `${item.client_id}::${item.sku}`;
       return {
@@ -3477,7 +3707,8 @@ async function renderStockCheckAction() {
     } catch (err) {
       setActionStatus(err.message || "Stock check failed", "error");
     }
-  }));
+    }));
+  }
   card.appendChild(nav);
   actionBody.appendChild(card);
 }

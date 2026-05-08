@@ -1239,6 +1239,9 @@ async function handleAllocateSearchOrders(supabase, searchParams) {
     .from("order_header")
     .select("\"order\",client_id,status,number_of_lines", { count: "exact" });
 
+  // Allocate flow only works with orders that are Ready.
+  query = query.eq("status", "Ready");
+
   for (const [key, value] of searchParams.entries()) {
     if (!isValidColumnName(key)) continue;
     const v = String(value || "").trim();
@@ -1874,6 +1877,114 @@ async function handleStockCheckApply(supabase, request) {
   return responseJson({ success: true, updated, errors, results });
 }
 
+async function handleStockCheckUp(supabase, request) {
+  const body = await parseRequestBody(request);
+  const location = String(body?.location || "").trim();
+  const rows = Array.isArray(body?.rows) ? body.rows : [];
+
+  if (!location) return responseJson({ error: "location is required" }, 400);
+  if (!rows.length) return responseJson({ error: "rows is required" }, 400);
+  if (rows.length > 5000) return responseJson({ error: "Maximum 5000 rows per request" }, 400);
+
+  const inventoryCols = await getTableColumnSet(supabase, "inventory");
+  const txnCols = await getTableColumnSet(supabase, "inventory_transaction");
+  const hasSuspenseCol = inventoryCols.has("suspense");
+
+  let updated = 0;
+  const errors = [];
+
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i] || {};
+    const clientId = String(row.client_id || "").trim();
+    const sku = String(row.sku || "").trim();
+    const tagId = String(row.tag_id || "").trim();
+    const updateQty = intFloor(row.update_qty, 0);
+
+    try {
+      if (!clientId || !sku) throw new Error("client_id and sku are required");
+      if (!Number.isFinite(updateQty) || updateQty <= 0) throw new Error("update_qty must be greater than 0");
+
+      let invRows = await fetchAllRows(
+        () =>
+          supabase
+            .from("inventory")
+            .select("id,qty_available,qty_allocated,suspense,tag_id")
+            .eq("location", location)
+            .eq("client_id", clientId)
+            .eq("sku", sku)
+            .order("id", { ascending: true }),
+        1000,
+        200000
+      );
+
+      if (!invRows.length) {
+        const insertPayload = {
+          location,
+          client_id: clientId,
+          sku,
+          qty_available: 0,
+          qty_allocated: 0,
+        };
+        if (tagId) insertPayload.tag_id = tagId;
+        if (hasSuspenseCol) insertPayload.suspense = 0;
+
+        const { error: insErr } = await supabase.from("inventory").insert(insertPayload);
+        if (insErr) throw insErr;
+
+        invRows = await fetchAllRows(
+          () =>
+            supabase
+              .from("inventory")
+              .select("id,qty_available,qty_allocated,suspense,tag_id")
+              .eq("location", location)
+              .eq("client_id", clientId)
+              .eq("sku", sku)
+              .order("id", { ascending: true }),
+          1000,
+          200000
+        );
+
+        if (!invRows.length) throw new Error("Failed to initialize inventory row");
+      }
+
+      const firstRow = invRows[0];
+      const nextAvail = intFloor(firstRow.qty_available, 0) + updateQty;
+      const updPayload = { qty_available: nextAvail };
+      if (tagId) updPayload.tag_id = tagId;
+      if (hasSuspenseCol) updPayload.suspense = intFloor(firstRow.suspense, 0) + updateQty;
+
+      const { error: updErr } = await supabase.from("inventory").update(updPayload).eq("id", firstRow.id);
+      if (updErr) throw updErr;
+
+      const txnPayload = {
+        code: "Stock check",
+        type: "Location Stock Check Up",
+        client_id: clientId,
+        sku,
+        location,
+        qty: updateQty,
+        description: `Stock check up at ${location}: +${updateQty}`,
+        status: "Checked",
+      };
+      if (tagId) txnPayload.tag_id = tagId;
+      if (txnCols.has("update_qty")) txnPayload.update_qty = updateQty;
+
+      const { error: txErr } = await supabase.from("inventory_transaction").insert(txnPayload);
+      if (txErr) throw txErr;
+
+      updated += 1;
+    } catch (err) {
+      errors.push({ row: i + 1, error: sanitizeMessage(err) });
+    }
+  }
+
+  if (!updated) {
+    return responseJson({ error: "No rows were updated", updated: 0, errors }, 400);
+  }
+
+  return responseJson({ success: true, updated, errors });
+}
+
 async function handleApiRequest(request, env) {
   if (request.method === "OPTIONS") {
     return new Response(null, { status: 204, headers: CORS_HEADERS });
@@ -1932,6 +2043,10 @@ async function handleApiRequest(request, env) {
 
   if (request.method === "POST" && pathname === "/api/actions/stock-check") {
     return handleStockCheckApply(supabase, request);
+  }
+
+  if (request.method === "POST" && pathname === "/api/actions/stock-check-up") {
+    return handleStockCheckUp(supabase, request);
   }
 
   const tableBulkStatus = getPathParam(pathname, /^\/api\/data\/([^/]+)\/bulk-status$/);
