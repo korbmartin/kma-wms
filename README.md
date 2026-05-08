@@ -44,6 +44,18 @@ Then open the local Worker URL printed by Wrangler.
 npm run deploy
 ```
 
+## Action Columns Migration (Supabase)
+
+New action workflows (Allocate / Pick / Stock Check) use:
+
+- `order_lines.ship_dock`
+- `inventory.suspense`
+- `inventory_transaction.update_qty`
+
+If your existing Supabase tables were created before these fields, run:
+
+- `db/add_action_columns.sql`
+
 ## Notes
 
 - The old local Docker/Postgres + Express backend flow was removed.

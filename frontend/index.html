@@ -26,6 +26,9 @@
         <div class="nav-dropdown-menu" id="menuImport">
           <button data-import="order">Orders + Lines</button>
           <button data-import="pre_advice">Pre-Advice + Lines</button>
+          <button data-action="allocate">Allocate</button>
+          <button data-action="pick">Pick</button>
+          <button data-action="stock_check">Stock Check</button>
         </div>
       </div>
       <div class="nav-dropdown">
@@ -175,6 +178,16 @@
         <p id="emptyMsg" class="empty-msg" style="display:none">No data found.</p>
         <p id="loadingMsg" class="loading-msg" style="display:none">Loading...</p>
       </div>
+    </section>
+
+    <!-- Action Workspace -->
+    <section id="actionPage" class="action-page" style="display:none">
+      <div class="action-header">
+        <h2 id="actionTitle">Action</h2>
+        <p id="actionHint" class="query-hint"></p>
+      </div>
+      <div id="actionBody" class="action-body"></div>
+      <div id="actionStatus" class="mass-create-status"></div>
     </section>
 
     <!-- Mass Create Overlay -->

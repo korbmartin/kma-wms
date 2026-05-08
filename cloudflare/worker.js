@@ -113,6 +113,17 @@ const STATUS_LOG_FIELDS = {
 };
 
 const TABLE_COLUMN_FALLBACKS = {
+  order_lines: [
+    { column_name: "order", data_type: "text" },
+    { column_name: "client_id", data_type: "text" },
+    { column_name: "line_id", data_type: "text" },
+    { column_name: "sku", data_type: "text" },
+    { column_name: "qty_ordered", data_type: "integer" },
+    { column_name: "qty_allocated", data_type: "integer" },
+    { column_name: "qty_picked", data_type: "integer" },
+    { column_name: "qty_shipped", data_type: "integer" },
+    { column_name: "ship_dock", data_type: "text" },
+  ],
   sku: [
     { column_name: "sku", data_type: "text" },
     { column_name: "description", data_type: "text" },
@@ -386,6 +397,11 @@ async function fetchTableColumns(supabase, tableName, sampleRows = []) {
   }
 
   return [];
+}
+
+async function getTableColumnSet(supabase, tableName) {
+  const columns = await fetchTableColumns(supabase, tableName);
+  return new Set((columns || []).map((c) => c.column_name));
 }
 
 async function fetchOneByPk(supabase, tableName, pks, pkValues, columns = "*") {
@@ -1212,6 +1228,652 @@ async function handleKpi(supabase, searchParams) {
   });
 }
 
+function intFloor(value, fallback = 0) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.floor(n);
+}
+
+async function handleAllocateSearchOrders(supabase, searchParams) {
+  let query = supabase
+    .from("order_header")
+    .select("\"order\",client_id,status,number_of_lines", { count: "exact" });
+
+  for (const [key, value] of searchParams.entries()) {
+    if (!isValidColumnName(key)) continue;
+    const v = String(value || "").trim();
+    if (!v) continue;
+    query = query.ilike(pgCol(key), `%${v}%`);
+  }
+
+  query = query.range(0, 499);
+  const { data, error } = await query;
+  if (error) throw error;
+  return responseJson({ rows: data || [] });
+}
+
+async function handleAllocateLines(supabase, searchParams) {
+  const rawOrders = String(searchParams.get("orders") || "").trim();
+  if (!rawOrders) {
+    return responseJson({ error: "Missing orders query parameter" }, 400);
+  }
+
+  const orders = rawOrders
+    .split(",")
+    .map((v) => v.trim())
+    .filter(Boolean)
+    .slice(0, 1000);
+
+  if (orders.length === 0) {
+    return responseJson({ error: "No valid orders provided" }, 400);
+  }
+
+  const chunks = chunkArray(orders, 200);
+  const rows = [];
+  for (const chunk of chunks) {
+    const chunkRows = await fetchAllRows(
+      () =>
+        supabase
+          .from("order_lines")
+          .select("\"order\",line_id,client_id,sku,qty_ordered,qty_allocated,qty_picked")
+          .in(pgCol("order"), chunk),
+      1000,
+      200000
+    );
+    rows.push(...chunkRows);
+  }
+
+  const result = rows.map((row) => {
+    const qtyOrdered = intFloor(row.qty_ordered, 0);
+    const qtyAllocated = intFloor(row.qty_allocated, 0);
+    return {
+      ...row,
+      qty_ordered: qtyOrdered,
+      qty_allocated: qtyAllocated,
+      qty_picked: intFloor(row.qty_picked, 0),
+      qty_remaining: Math.max(qtyOrdered - qtyAllocated, 0),
+    };
+  });
+
+  return responseJson({ rows: result });
+}
+
+async function handleAllocateShipDocks(supabase, searchParams) {
+  const clientId = String(searchParams.get("client_id") || "").trim();
+  if (!clientId) {
+    return responseJson({ error: "Missing client_id query parameter" }, 400);
+  }
+
+  const rows = await fetchAllRows(
+    () =>
+      supabase
+        .from("location")
+        .select("location,client_id,location_type")
+        .eq("client_id", clientId)
+        .ilike("location_type", "ship dock"),
+    1000,
+    200000
+  );
+
+  return responseJson({ rows });
+}
+
+async function updateOrderHeaderStatusToAllocated(supabase, orderNum) {
+  if (!orderNum) return false;
+  const oldRow = await fetchOneByPk(supabase, "order_header", ["order"], { order: orderNum }, "status");
+  const oldStatus = oldRow ? oldRow.status : null;
+  const { error } = await supabase.from("order_header").update({ status: "Allocated" }).eq(pgCol("order"), orderNum);
+  if (error) throw error;
+  if (oldStatus !== "Allocated") {
+    try {
+      await logStatusChange(supabase, "order_header", { order: orderNum });
+    } catch (logErr) {
+      console.error("Status log error:", sanitizeMessage(logErr));
+    }
+  }
+  return true;
+}
+
+async function handleAllocate(supabase, request) {
+  const body = await parseRequestBody(request);
+  const shipDock = String(body?.ship_dock || "").trim();
+  const lines = Array.isArray(body?.lines) ? body.lines : [];
+
+  if (!shipDock) return responseJson({ error: "ship_dock is required" }, 400);
+  if (lines.length === 0) return responseJson({ error: "No lines provided" }, 400);
+  if (lines.length > 5000) return responseJson({ error: "Maximum 5000 lines per request" }, 400);
+
+  const shipDockRows = await fetchAllRows(
+    () =>
+      supabase
+        .from("location")
+        .select("location,client_id,location_type")
+        .eq("location", shipDock)
+        .ilike("location_type", "ship dock"),
+    100,
+    1000
+  );
+
+  if (!shipDockRows.length) {
+    return responseJson({ error: `Ship dock '${shipDock}' does not exist with location_type 'ship dock'` }, 400);
+  }
+  const shipDockRow = shipDockRows[0];
+
+  const lineCols = await getTableColumnSet(supabase, "order_lines");
+  if (!lineCols.has("ship_dock")) {
+    return responseJson(
+      {
+        error:
+          "order_lines.ship_dock column is missing. Run: ALTER TABLE order_lines ADD COLUMN ship_dock VARCHAR(100);",
+      },
+      400
+    );
+  }
+
+  let allocatedLines = 0;
+  const updatedOrders = new Set();
+  const errors = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const req = lines[i] || {};
+    const orderNum = String(req.order || "").trim();
+    const lineId = String(req.line_id || "").trim();
+    const qtyReq = intFloor(req.qty, 0);
+
+    try {
+      if (!orderNum || !lineId) throw new Error("order and line_id are required");
+      if (qtyReq <= 0) throw new Error("qty must be greater than 0");
+
+      const line = await fetchOneByPk(
+        supabase,
+        "order_lines",
+        ["order", "line_id"],
+        { order: orderNum, line_id: lineId },
+        "\"order\",line_id,client_id,sku,qty_ordered,qty_allocated,qty_picked"
+      );
+      if (!line) throw new Error(`Order line '${orderNum}/${lineId}' not found`);
+      if (!line.sku) throw new Error(`Order line '${orderNum}/${lineId}' has no SKU`);
+      if (!line.client_id) throw new Error(`Order line '${orderNum}/${lineId}' has no client_id`);
+
+      if (String(shipDockRow.client_id || "") !== String(line.client_id || "")) {
+        throw new Error(`Ship dock '${shipDock}' does not belong to client '${line.client_id}'`);
+      }
+
+      const qtyOrdered = intFloor(line.qty_ordered, 0);
+      const qtyAllocated = intFloor(line.qty_allocated, 0);
+      const remaining = Math.max(qtyOrdered - qtyAllocated, 0);
+      if (qtyReq > remaining) {
+        throw new Error(`Requested qty ${qtyReq} exceeds remaining allocatable qty ${remaining}`);
+      }
+
+      const invRows = await fetchAllRows(
+        () =>
+          supabase
+            .from("inventory")
+            .select("id,client_id,sku,location,qty_available,qty_allocated")
+            .eq("client_id", line.client_id)
+            .eq("sku", line.sku)
+            .gt("qty_available", 0)
+            .order("id", { ascending: true }),
+        1000,
+        200000
+      );
+
+      let availableTotal = 0;
+      invRows.forEach((r) => {
+        availableTotal += intFloor(r.qty_available, 0);
+      });
+      if (availableTotal < qtyReq) {
+        throw new Error(`Not enough available stock for SKU '${line.sku}'. Needed ${qtyReq}, available ${availableTotal}.`);
+      }
+
+      let remainingToAllocate = qtyReq;
+      for (const inv of invRows) {
+        if (remainingToAllocate <= 0) break;
+        const avail = intFloor(inv.qty_available, 0);
+        const take = Math.min(avail, remainingToAllocate);
+        if (take <= 0) continue;
+
+        const newAvail = avail - take;
+        const newAlloc = intFloor(inv.qty_allocated, 0) + take;
+        const { error: invErr } = await supabase
+          .from("inventory")
+          .update({ qty_available: newAvail, qty_allocated: newAlloc })
+          .eq("id", inv.id);
+        if (invErr) throw invErr;
+
+        await supabase.from("inventory_transaction").insert({
+          code: "Allocate",
+          type: "Order Line",
+          client_id: line.client_id,
+          sku: line.sku,
+          location: inv.location,
+          qty: take,
+          order: orderNum,
+          order_line_id: lineId,
+          description: `Allocated to ship dock ${shipDock}`,
+          status: "Allocated",
+        });
+
+        remainingToAllocate -= take;
+      }
+
+      const newLineAlloc = qtyAllocated + qtyReq;
+      const { error: lineErr } = await supabase
+        .from("order_lines")
+        .update({ qty_allocated: newLineAlloc, ship_dock: shipDock })
+        .eq(pgCol("order"), orderNum)
+        .eq("line_id", lineId);
+      if (lineErr) throw lineErr;
+
+      allocatedLines += 1;
+      updatedOrders.add(orderNum);
+    } catch (err) {
+      errors.push({ row: i + 1, error: sanitizeMessage(err), line: req });
+    }
+  }
+
+  let updatedOrderCount = 0;
+  for (const orderNum of updatedOrders) {
+    await updateOrderHeaderStatusToAllocated(supabase, orderNum);
+    updatedOrderCount += 1;
+  }
+
+  if (allocatedLines === 0) {
+    return responseJson({ error: "No lines were allocated", allocated_lines: 0, updated_orders: 0, errors }, 400);
+  }
+
+  return responseJson({
+    success: true,
+    allocated_lines: allocatedLines,
+    updated_orders: updatedOrderCount,
+    errors,
+  });
+}
+
+async function handlePickOrderLoad(supabase, searchParams) {
+  const orderNum = String(searchParams.get("order") || "").trim();
+  if (!orderNum) return responseJson({ error: "Missing order query parameter" }, 400);
+
+  const lines = await fetchAllRows(
+    () =>
+      supabase
+        .from("order_lines")
+        .select("\"order\",line_id,client_id,sku,qty_ordered,qty_allocated,qty_picked,ship_dock")
+        .eq(pgCol("order"), orderNum)
+        .order("line_id", { ascending: true }),
+    1000,
+    200000
+  );
+
+  if (!lines.length) {
+    return responseJson({ error: `Order '${orderNum}' has no lines` }, 404);
+  }
+
+  const resultLines = [];
+  for (const line of lines) {
+    const qtyOrdered = intFloor(line.qty_ordered, 0);
+    const qtyAllocated = intFloor(line.qty_allocated, 0);
+    const qtyPicked = intFloor(line.qty_picked, 0);
+    const remainingToPick = Math.max(qtyAllocated - qtyPicked, 0);
+
+    const locations = await fetchAllRows(
+      () =>
+        supabase
+          .from("inventory")
+          .select("id,location,qty_available,qty_allocated")
+          .eq("client_id", line.client_id)
+          .eq("sku", line.sku)
+          .or("qty_available.gt.0,qty_allocated.gt.0")
+          .order("id", { ascending: true }),
+      1000,
+      200000
+    );
+
+    resultLines.push({
+      ...line,
+      qty_ordered: qtyOrdered,
+      qty_allocated: qtyAllocated,
+      qty_picked: qtyPicked,
+      remaining_to_pick: remainingToPick,
+      locations: (locations || []).map((loc) => ({
+        location: loc.location,
+        qty_available: intFloor(loc.qty_available, 0),
+        qty_allocated: intFloor(loc.qty_allocated, 0),
+      })),
+    });
+  }
+
+  const pickLines = resultLines.filter((l) => l.remaining_to_pick > 0);
+  return responseJson({
+    order: orderNum,
+    lines: pickLines.length > 0 ? pickLines : resultLines,
+  });
+}
+
+async function setOrderHeaderPickedIfComplete(supabase, orderNum) {
+  const rows = await fetchAllRows(
+    () => supabase.from("order_lines").select("qty_allocated,qty_picked").eq(pgCol("order"), orderNum),
+    1000,
+    200000
+  );
+  if (!rows.length) return;
+
+  const hasOutstanding = rows.some((r) => intFloor(r.qty_allocated, 0) - intFloor(r.qty_picked, 0) > 0);
+  if (!hasOutstanding) {
+    const oldRow = await fetchOneByPk(supabase, "order_header", ["order"], { order: orderNum }, "status");
+    const oldStatus = oldRow ? oldRow.status : null;
+    const { error } = await supabase.from("order_header").update({ status: "Picked" }).eq(pgCol("order"), orderNum);
+    if (error) throw error;
+    if (oldStatus !== "Picked") {
+      try {
+        await logStatusChange(supabase, "order_header", { order: orderNum });
+      } catch (logErr) {
+        console.error("Status log error:", sanitizeMessage(logErr));
+      }
+    }
+  }
+}
+
+async function handlePickLine(supabase, request) {
+  const body = await parseRequestBody(request);
+  const orderNum = String(body?.order || "").trim();
+  const lineId = String(body?.line_id || "").trim();
+  const location = String(body?.location || "").trim();
+  const qty = intFloor(body?.qty, 0);
+
+  if (!orderNum || !lineId || !location) {
+    return responseJson({ error: "order, line_id and location are required" }, 400);
+  }
+  if (qty <= 0) return responseJson({ error: "qty must be greater than 0" }, 400);
+
+  const line = await fetchOneByPk(
+    supabase,
+    "order_lines",
+    ["order", "line_id"],
+    { order: orderNum, line_id: lineId },
+    "\"order\",line_id,client_id,sku,qty_allocated,qty_picked"
+  );
+  if (!line) return responseJson({ error: `Order line '${orderNum}/${lineId}' not found` }, 404);
+
+  const alloc = intFloor(line.qty_allocated, 0);
+  const picked = intFloor(line.qty_picked, 0);
+  const remainingToPick = Math.max(alloc - picked, 0);
+  if (remainingToPick <= 0) {
+    return responseJson({ error: `Line '${orderNum}/${lineId}' has no allocated qty left to pick` }, 400);
+  }
+  if (qty > remainingToPick) {
+    return responseJson({ error: `Pick qty ${qty} exceeds remaining qty ${remainingToPick}` }, 400);
+  }
+
+  const invRows = await fetchAllRows(
+    () =>
+      supabase
+        .from("inventory")
+        .select("id,location,qty_available,qty_allocated")
+        .eq("client_id", line.client_id)
+        .eq("sku", line.sku)
+        .eq("location", location)
+        .or("qty_available.gt.0,qty_allocated.gt.0")
+        .order("id", { ascending: true }),
+    1000,
+    200000
+  );
+
+  if (!invRows.length) {
+    return responseJson({ error: `No stock available at location '${location}' for SKU '${line.sku}'` }, 400);
+  }
+
+  let pickableTotal = 0;
+  invRows.forEach((r) => {
+    pickableTotal += intFloor(r.qty_allocated, 0) + intFloor(r.qty_available, 0);
+  });
+  if (pickableTotal < qty) {
+    return responseJson({ error: `Not enough stock at '${location}'. Requested ${qty}, available ${pickableTotal}.` }, 400);
+  }
+
+  let remaining = qty;
+  let finalLocationQty = 0;
+
+  for (const inv of invRows) {
+    const currAlloc = intFloor(inv.qty_allocated, 0);
+    const currAvail = intFloor(inv.qty_available, 0);
+    let takeAlloc = 0;
+    let takeAvail = 0;
+
+    if (remaining > 0 && currAlloc > 0) {
+      takeAlloc = Math.min(currAlloc, remaining);
+      remaining -= takeAlloc;
+    }
+    if (remaining > 0 && currAvail > 0) {
+      takeAvail = Math.min(currAvail, remaining);
+      remaining -= takeAvail;
+    }
+
+    const newAlloc = currAlloc - takeAlloc;
+    const newAvail = currAvail - takeAvail;
+    finalLocationQty += newAlloc + newAvail;
+
+    const { error: updErr } = await supabase
+      .from("inventory")
+      .update({ qty_allocated: newAlloc, qty_available: newAvail })
+      .eq("id", inv.id);
+    if (updErr) throw updErr;
+  }
+
+  const newPicked = picked + qty;
+  const { error: lineErr } = await supabase
+    .from("order_lines")
+    .update({ qty_picked: newPicked })
+    .eq(pgCol("order"), orderNum)
+    .eq("line_id", lineId);
+  if (lineErr) throw lineErr;
+
+  await supabase.from("inventory_transaction").insert({
+    code: "Pick",
+    type: "Order Line",
+    client_id: line.client_id,
+    sku: line.sku,
+    location,
+    qty,
+    order: orderNum,
+    order_line_id: lineId,
+    description: `Picked from ${location}`,
+    status: "Picked",
+  });
+
+  await setOrderHeaderPickedIfComplete(supabase, orderNum);
+
+  return responseJson({
+    success: true,
+    location_qty_after: finalLocationQty,
+    line: {
+      order: orderNum,
+      line_id: lineId,
+      qty_allocated: alloc,
+      qty_picked: newPicked,
+    },
+  });
+}
+
+async function buildLocationStockSummary(supabase, location) {
+  const rows = await fetchAllRows(
+    () =>
+      supabase
+        .from("inventory")
+        .select("id,client_id,sku,location,qty_available,qty_allocated")
+        .eq("location", location)
+        .order("id", { ascending: true }),
+    1000,
+    200000
+  );
+
+  const map = new Map();
+  for (const row of rows) {
+    const key = `${row.client_id || ""}::${row.sku || ""}`;
+    const prev = map.get(key) || {
+      client_id: row.client_id || "",
+      sku: row.sku || "",
+      current_qty: 0,
+      qty_available: 0,
+      qty_allocated: 0,
+      row_ids: [],
+    };
+    prev.current_qty += intFloor(row.qty_available, 0) + intFloor(row.qty_allocated, 0);
+    prev.qty_available += intFloor(row.qty_available, 0);
+    prev.qty_allocated += intFloor(row.qty_allocated, 0);
+    prev.row_ids.push(row.id);
+    map.set(key, prev);
+  }
+
+  return {
+    rows,
+    items: Array.from(map.values()),
+  };
+}
+
+async function handleStockCheckLocation(supabase, searchParams) {
+  const location = String(searchParams.get("location") || "").trim();
+  if (!location) return responseJson({ error: "Missing location query parameter" }, 400);
+  const summary = await buildLocationStockSummary(supabase, location);
+  return responseJson({ location, items: summary.items });
+}
+
+async function applyStockCheckDelta(supabase, payload) {
+  const location = String(payload?.location || "").trim();
+  const clientId = String(payload?.client_id || "").trim();
+  const sku = String(payload?.sku || "").trim();
+  const countedQty = intFloor(payload?.counted_qty, 0);
+
+  if (!location || !clientId || !sku) {
+    throw new Error("location, client_id and sku are required");
+  }
+  if (countedQty < 0) throw new Error("counted_qty cannot be negative");
+
+  const invRows = await fetchAllRows(
+    () =>
+      supabase
+        .from("inventory")
+        .select("id,client_id,sku,location,qty_available,qty_allocated,suspense")
+        .eq("location", location)
+        .eq("client_id", clientId)
+        .eq("sku", sku)
+        .order("id", { ascending: true }),
+    1000,
+    200000
+  );
+
+  if (!invRows.length) throw new Error(`No inventory row found for ${clientId}/${sku} at ${location}`);
+
+  let totalAvail = 0;
+  let totalAlloc = 0;
+  invRows.forEach((r) => {
+    totalAvail += intFloor(r.qty_available, 0);
+    totalAlloc += intFloor(r.qty_allocated, 0);
+  });
+
+  const currentQty = totalAvail + totalAlloc;
+  const delta = countedQty - currentQty;
+  const newAllocTotal = Math.min(totalAlloc, countedQty);
+  const newAvailTotal = countedQty - newAllocTotal;
+
+  const invCols = await getTableColumnSet(supabase, "inventory");
+  const hasSuspenseCol = invCols.has("suspense");
+
+  let remAlloc = newAllocTotal;
+  let remAvail = newAvailTotal;
+  for (let i = 0; i < invRows.length; i++) {
+    const row = invRows[i];
+    const isLast = i === invRows.length - 1;
+    const currAlloc = intFloor(row.qty_allocated, 0);
+    let rowAlloc = Math.min(currAlloc, remAlloc);
+    remAlloc -= rowAlloc;
+    if (isLast && remAlloc > 0) {
+      rowAlloc += remAlloc;
+      remAlloc = 0;
+    }
+
+    let rowAvail = 0;
+    if (isLast) {
+      rowAvail = remAvail;
+      remAvail = 0;
+    } else {
+      const currAvail = intFloor(row.qty_available, 0);
+      rowAvail = Math.min(currAvail, remAvail);
+      remAvail -= rowAvail;
+    }
+
+    const upd = { qty_allocated: rowAlloc, qty_available: rowAvail };
+    if (hasSuspenseCol) {
+      upd.suspense = delta;
+    }
+    const { error: updErr } = await supabase.from("inventory").update(upd).eq("id", row.id);
+    if (updErr) throw updErr;
+  }
+
+  const txnCols = await getTableColumnSet(supabase, "inventory_transaction");
+  const txnPayload = {
+    code: "Stock check",
+    type: "Location Stock Check",
+    client_id: clientId,
+    sku,
+    location,
+    qty: countedQty,
+    description: `Stock check at ${location}: system ${currentQty}, counted ${countedQty}, delta ${delta >= 0 ? "+" : ""}${delta}`,
+    status: "Checked",
+  };
+  if (txnCols.has("update_qty")) {
+    txnPayload.update_qty = delta;
+  }
+  const { error: txErr } = await supabase.from("inventory_transaction").insert(txnPayload);
+  if (txErr) throw txErr;
+
+  return { location, client_id: clientId, sku, current_qty: currentQty, counted_qty: countedQty, delta };
+}
+
+async function handlePickStockAdjust(supabase, request) {
+  const body = await parseRequestBody(request);
+  try {
+    const result = await applyStockCheckDelta(supabase, body);
+    return responseJson({ success: true, result });
+  } catch (err) {
+    return responseJson({ error: sanitizeMessage(err) }, 400);
+  }
+}
+
+async function handleStockCheckApply(supabase, request) {
+  const body = await parseRequestBody(request);
+  const location = String(body?.location || "").trim();
+  const counts = Array.isArray(body?.counts) ? body.counts : [];
+  if (!location) return responseJson({ error: "location is required" }, 400);
+  if (!counts.length) return responseJson({ error: "counts is required" }, 400);
+  if (counts.length > 5000) return responseJson({ error: "Maximum 5000 count rows per request" }, 400);
+
+  let updated = 0;
+  const errors = [];
+  const results = [];
+  for (let i = 0; i < counts.length; i++) {
+    const countRow = counts[i] || {};
+    try {
+      const result = await applyStockCheckDelta(supabase, {
+        location,
+        client_id: countRow.client_id,
+        sku: countRow.sku,
+        counted_qty: countRow.counted_qty,
+      });
+      results.push(result);
+      updated += 1;
+    } catch (err) {
+      errors.push({ row: i + 1, error: sanitizeMessage(err) });
+    }
+  }
+
+  if (!updated) {
+    return responseJson({ error: "No rows were updated", updated: 0, errors }, 400);
+  }
+  return responseJson({ success: true, updated, errors, results });
+}
+
 async function handleApiRequest(request, env) {
   if (request.method === "OPTIONS") {
     return new Response(null, { status: 204, headers: CORS_HEADERS });
@@ -1234,6 +1896,42 @@ async function handleApiRequest(request, env) {
 
   if (request.method === "GET" && pathname === "/api/tables") {
     return responseJson(Object.keys(TABLES));
+  }
+
+  if (request.method === "GET" && pathname === "/api/actions/allocate/orders") {
+    return handleAllocateSearchOrders(supabase, url.searchParams);
+  }
+
+  if (request.method === "GET" && pathname === "/api/actions/allocate/lines") {
+    return handleAllocateLines(supabase, url.searchParams);
+  }
+
+  if (request.method === "GET" && pathname === "/api/actions/allocate/ship-docks") {
+    return handleAllocateShipDocks(supabase, url.searchParams);
+  }
+
+  if (request.method === "POST" && pathname === "/api/actions/allocate") {
+    return handleAllocate(supabase, request);
+  }
+
+  if (request.method === "GET" && pathname === "/api/actions/pick/order") {
+    return handlePickOrderLoad(supabase, url.searchParams);
+  }
+
+  if (request.method === "POST" && pathname === "/api/actions/pick") {
+    return handlePickLine(supabase, request);
+  }
+
+  if (request.method === "POST" && pathname === "/api/actions/pick/stock-adjust") {
+    return handlePickStockAdjust(supabase, request);
+  }
+
+  if (request.method === "GET" && pathname === "/api/actions/stock-check/location") {
+    return handleStockCheckLocation(supabase, url.searchParams);
+  }
+
+  if (request.method === "POST" && pathname === "/api/actions/stock-check") {
+    return handleStockCheckApply(supabase, request);
   }
 
   const tableBulkStatus = getPathParam(pathname, /^\/api\/data\/([^/]+)\/bulk-status$/);

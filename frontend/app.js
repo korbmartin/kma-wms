@@ -87,6 +87,11 @@ const kpiPage = document.getElementById("kpiPage");
 const kpiMonth = document.getElementById("kpiMonth");
 const kpiPrevMonth = document.getElementById("kpiPrevMonth");
 const kpiNextMonth = document.getElementById("kpiNextMonth");
+const actionPage = document.getElementById("actionPage");
+const actionTitle = document.getElementById("actionTitle");
+const actionHint = document.getElementById("actionHint");
+const actionBody = document.getElementById("actionBody");
+const actionStatus = document.getElementById("actionStatus");
 const loginOverlay = document.getElementById("loginOverlay");
 const loginForm = document.getElementById("loginForm");
 const loginUsername = document.getElementById("loginUsername");
@@ -98,12 +103,14 @@ const loginError = document.getElementById("loginError");
 let kpiSelectedMonth = null; // null = current month
 
 let activeTable = null;
+let activeActionKey = null;
 let currentColumns = [];
 let currentPrimaryKeys = [];
 let queryInputs = {};
 let sortColumn = null;
 let sortDirection = null; // "asc" | "desc" | null
 let lastClickedRowIdx = null;
+let actionState = null;
 
 // ── Friendly display names for tables ──────────────────────────
 const TABLE_LABELS = {
@@ -123,6 +130,12 @@ const TABLE_LABELS = {
   pre_advice_status_codes: "Pre-Advice Status Codes",
   order_status_codes: "Order Status Codes",
   order_header_status_codes: "Order Header Status Codes",
+};
+
+const ACTION_LABELS = {
+  allocate: "Allocate",
+  pick: "Pick",
+  stock_check: "Stock Check",
 };
 
 // ── Dropdown field config: table → field → { lookupTable, valueCol, default } ──
@@ -180,9 +193,9 @@ const READ_ONLY_COLUMNS = {
 // Required fields per table (must be non-empty to create)
 const REQUIRED_FIELDS = {
   order_header: ["order", "client_id", "status"],
-  order_lines: ["order", "client_id"],
+  order_lines: ["order", "client_id", "sku"],
   pre_advice: ["pre_advice_id", "client_id", "status"],
-  pre_advice_lines: ["pre_advice_id", "client_id"],
+  pre_advice_lines: ["pre_advice_id", "client_id", "sku"],
   location: ["location", "client_id"],
   sku: ["sku", "client_id"],
 };
@@ -190,9 +203,9 @@ const REQUIRED_FIELDS = {
 // Mass create: required fields (before defaults are applied)
 const MASS_REQUIRED_FIELDS = {
   order_header: ["order", "client_id"],
-  order_lines: ["order", "client_id"],
+  order_lines: ["order", "client_id", "sku"],
   pre_advice: ["pre_advice_id", "client_id"],
-  pre_advice_lines: ["pre_advice_id", "client_id"],
+  pre_advice_lines: ["pre_advice_id", "client_id", "sku"],
   location: ["location", "client_id"],
   sku: ["sku", "client_id"],
 };
@@ -400,6 +413,11 @@ function saveTabState() {
   const tab = tabs.find((t) => t.id === activeTabId);
   if (!tab) return;
 
+  if (tab.kind === "action") {
+    tab.actionState = actionState ? JSON.parse(JSON.stringify(actionState)) : null;
+    return;
+  }
+
   tab.table = activeTable;
   tab.isCreateMode = isCreateMode;
 
@@ -428,7 +446,24 @@ function saveTabState() {
 }
 
 async function restoreTabState(tab) {
+  if (!tab) return;
+
   activeTabId = tab.id;
+
+  if (tab.kind === "action") {
+    activeTable = null;
+    currentColumns = [];
+    currentPrimaryKeys = [];
+    activeActionKey = tab.actionKey || null;
+    actionState = tab.actionState ? JSON.parse(JSON.stringify(tab.actionState)) : null;
+    updateDropdownActive();
+    await renderActionTab(activeActionKey, actionState);
+    renderTabBar();
+    return;
+  }
+
+  activeActionKey = null;
+  actionState = null;
   activeTable = tab.table;
   currentColumns = tab.columns || [];
   currentPrimaryKeys = tab.primaryKeys || [];
@@ -448,6 +483,7 @@ async function restoreTabState(tab) {
   if (!tab.table) {
     queryPage.style.display = "none";
     resultsPage.style.display = "none";
+    actionPage.style.display = "none";
     return;
   }
 
@@ -524,6 +560,7 @@ function openTab(table, filters) {
 
   const tab = {
     id: generateTabId(),
+    kind: "table",
     table: table,
     label: label,
     page: "query",
@@ -538,6 +575,32 @@ function openTab(table, filters) {
     isCreateMode: false,
     filters: {},
     preCreateQueryValues: null,
+  };
+
+  tabs.push(tab);
+  activeTabId = tab.id;
+  renderTabBar();
+  return tab;
+}
+
+function openActionTab(actionKey) {
+  if (tabs.length >= MAX_TABS) {
+    const oldest = tabs.find((t) => t.id !== activeTabId) || tabs[0];
+    closeTab(oldest.id);
+  }
+
+  if (activeTabId) saveTabState();
+
+  const baseName = ACTION_LABELS[actionKey] || actionKey;
+  const sameActionCount = tabs.filter((t) => t.kind === "action" && t.actionKey === actionKey).length;
+  const label = sameActionCount > 0 ? `${baseName} ${sameActionCount + 1}` : baseName;
+
+  const tab = {
+    id: generateTabId(),
+    kind: "action",
+    actionKey,
+    actionState: null,
+    label,
   };
 
   tabs.push(tab);
@@ -562,6 +625,8 @@ function closeTab(tabId) {
   if (tabs.length === 0) {
     activeTabId = null;
     activeTable = null;
+    activeActionKey = null;
+    actionState = null;
     showKpiPage();
     renderTabBar();
     return;
@@ -626,6 +691,7 @@ function showQueryPage() {
   kpiPage.style.display = "none";
   queryPage.style.display = "block";
   resultsPage.style.display = "none";
+  actionPage.style.display = "none";
   kpiNavBtn.classList.remove("active");
 }
 
@@ -633,6 +699,7 @@ function showResultsPage() {
   kpiPage.style.display = "none";
   queryPage.style.display = "none";
   resultsPage.style.display = "block";
+  actionPage.style.display = "none";
   backToQueryBtn.style.display = SKIP_QUERY_TABLES.includes(activeTable) ? "none" : "";
   kpiNavBtn.classList.remove("active");
 }
@@ -641,9 +708,18 @@ function showKpiPage() {
   kpiPage.style.display = "block";
   queryPage.style.display = "none";
   resultsPage.style.display = "none";
+  actionPage.style.display = "none";
   kpiNavBtn.classList.add("active");
   updateDropdownActive();
   loadKpiData();
+}
+
+function showActionPage() {
+  kpiPage.style.display = "none";
+  queryPage.style.display = "none";
+  resultsPage.style.display = "none";
+  actionPage.style.display = "block";
+  kpiNavBtn.classList.remove("active");
 }
 
 // ── Lookup tables that skip the query page ──────────────────
@@ -657,6 +733,8 @@ async function selectTable(table, preFilters) {
 
 async function selectTableIntoTab(table, preFilters) {
   activeTable = table;
+  activeActionKey = null;
+  actionState = null;
   if (isCreateMode) exitCreateMode();
 
   updateDropdownActive();
@@ -2306,7 +2384,7 @@ const IMPORT_CONFIGS = {
       { col: "deliver_by_date", target: "header" },
       { col: "notes", target: "line" },
     ],
-    required: ["order", "client_id"],
+    required: ["order", "client_id", "l:sku"],
     headerDefaults: { status: "Ready" },
     lineDefaults: {},
   },
@@ -2343,7 +2421,7 @@ const IMPORT_CONFIGS = {
       { col: "lot_po_number", target: "line" },
       { col: "product_group", target: "line" },
     ],
-    required: ["pre_advice_id", "client_id"],
+    required: ["pre_advice_id", "client_id", "l:sku"],
     headerDefaults: { status: "Incoming" },
     lineDefaults: {},
   },
@@ -2675,6 +2753,13 @@ menuImport.querySelectorAll("button[data-import]").forEach((btn) => {
     openImport(btn.dataset.import);
   });
 });
+menuImport.querySelectorAll("button[data-action]").forEach((btn) => {
+  btn.addEventListener("click", async (e) => {
+    e.stopPropagation();
+    document.querySelectorAll(".nav-dropdown").forEach((d) => d.classList.remove("open"));
+    await startActionTab(btn.dataset.action);
+  });
+});
 importAddRowBtn.addEventListener("click", () => addImportRows(1));
 importTemplateBtn.addEventListener("click", () => {
   if (!importMode || !importColumns.length) return;
@@ -2701,6 +2786,701 @@ importOverlay.addEventListener("click", (e) => {
   if (e.target === importOverlay) closeImport();
 });
 importBody.addEventListener("input", () => updateImportRowCount());
+
+// Action workflows (Allocate, Pick, Stock Check)
+const ACTION_HINTS = {
+  allocate: "Find orders, select lines to allocate, then assign a valid ship dock for the client.",
+  pick: "Pick one order at a time, line by line, from warehouse locations.",
+  stock_check: "Double-scan a location, then reconcile counted stock with system stock.",
+};
+
+let allocateFilterColumns = null;
+
+function cloneState(value) {
+  return value ? JSON.parse(JSON.stringify(value)) : null;
+}
+
+function setActionStatus(message, type = "") {
+  actionStatus.textContent = message || "";
+  actionStatus.className = `mass-create-status${type ? ` ${type}` : ""}`;
+}
+
+function resetActionStatus() {
+  setActionStatus("");
+}
+
+function clearNode(node) {
+  while (node.firstChild) node.removeChild(node.firstChild);
+}
+
+function getActiveTab() {
+  return tabs.find((t) => t.id === activeTabId) || null;
+}
+
+function setActiveActionState(nextState) {
+  actionState = nextState;
+  const tab = getActiveTab();
+  if (tab && tab.kind === "action") {
+    tab.actionState = cloneState(nextState);
+  }
+}
+
+function defaultActionState(actionKey) {
+  if (actionKey === "allocate") {
+    return {
+      step: 1,
+      filters: {},
+      orders: [],
+      selectedOrders: [],
+      lines: [],
+      selectedLines: [],
+      qtyByLine: {},
+      shipDockOptions: [],
+      shipDock: "",
+      selectedClientId: "",
+      result: null,
+    };
+  }
+  if (actionKey === "pick") {
+    return {
+      step: 1,
+      order: "",
+      lines: [],
+      currentIndex: 0,
+      resultLines: [],
+    };
+  }
+  return {
+    step: 1,
+    locationA: "",
+    locationB: "",
+    items: [],
+    countedByKey: {},
+  };
+}
+
+async function getAllocateFilterColumns() {
+  if (allocateFilterColumns) return allocateFilterColumns;
+  const res = await fetch(`${API_BASE}/data/order_header?limit=0`);
+  const data = await res.json();
+  allocateFilterColumns = (data.columns || []).map((c) => c.column_name);
+  return allocateFilterColumns;
+}
+
+function parseLineKey(key) {
+  const parts = String(key || "").split("::");
+  return { order: parts[0] || "", line_id: parts[1] || "" };
+}
+
+function makeActionCard(titleText) {
+  const card = document.createElement("div");
+  card.className = "action-card";
+  const title = document.createElement("div");
+  title.className = "action-step-title";
+  title.textContent = titleText;
+  card.appendChild(title);
+  return card;
+}
+
+function makeActionButton(text, className, onClick) {
+  const btn = document.createElement("button");
+  btn.textContent = text;
+  btn.className = className || "";
+  btn.addEventListener("click", onClick);
+  return btn;
+}
+
+function makeActionInput(labelText, value, onInput) {
+  const wrap = document.createElement("div");
+  wrap.className = "query-field";
+  const label = document.createElement("label");
+  label.textContent = labelText;
+  const input = document.createElement("input");
+  input.type = "text";
+  input.value = value || "";
+  input.addEventListener("input", () => onInput(input.value));
+  wrap.appendChild(label);
+  wrap.appendChild(input);
+  return { wrap, input };
+}
+
+async function renderActionTab(actionKey, savedState) {
+  activeActionKey = actionKey;
+  const state = savedState ? cloneState(savedState) : defaultActionState(actionKey);
+  setActiveActionState(state);
+  actionTitle.textContent = ACTION_LABELS[actionKey] || "Action";
+  actionHint.textContent = ACTION_HINTS[actionKey] || "";
+  clearNode(actionBody);
+  resetActionStatus();
+  showActionPage();
+
+  if (actionKey === "allocate") {
+    await renderAllocateAction();
+    return;
+  }
+  if (actionKey === "pick") {
+    await renderPickAction();
+    return;
+  }
+  await renderStockCheckAction();
+}
+
+async function startActionTab(actionKey) {
+  openActionTab(actionKey);
+  await renderActionTab(actionKey, null);
+  renderTabBar();
+}
+
+async function renderAllocateAction() {
+  const state = actionState || defaultActionState("allocate");
+  setActiveActionState(state);
+  clearNode(actionBody);
+
+  if (state.step === 1) {
+    const filtersCard = makeActionCard("Step 1: Search Orders");
+    const cols = await getAllocateFilterColumns();
+    const fieldsWrap = document.createElement("div");
+    fieldsWrap.className = "query-fields";
+    cols.forEach((col) => {
+      const { wrap } = makeActionInput(col.replace(/_/g, " "), state.filters[col] || "", (val) => {
+        state.filters[col] = val;
+      });
+      fieldsWrap.appendChild(wrap);
+    });
+    filtersCard.appendChild(fieldsWrap);
+
+    const actions = document.createElement("div");
+    actions.className = "action-row";
+    actions.appendChild(makeActionButton("Search", "btn-create", async () => {
+      try {
+        const params = new URLSearchParams();
+        Object.entries(state.filters).forEach(([k, v]) => {
+          if (String(v || "").trim() !== "") params.set(k, String(v).trim());
+        });
+        const res = await fetch(`${API_BASE}/actions/allocate/orders?${params.toString()}`);
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || "Failed to load orders");
+        state.orders = data.rows || [];
+        state.selectedOrders = [];
+        setActiveActionState(state);
+        await renderAllocateAction();
+      } catch (err) {
+        setActionStatus(err.message || "Failed to search orders", "error");
+      }
+    }));
+    actions.appendChild(makeActionButton("Clear Filters", "btn-secondary", async () => {
+      state.filters = {};
+      state.orders = [];
+      state.selectedOrders = [];
+      setActiveActionState(state);
+      await renderAllocateAction();
+    }));
+    filtersCard.appendChild(actions);
+    actionBody.appendChild(filtersCard);
+
+    if (state.orders.length > 0) {
+      const resultsCard = makeActionCard("Matching Orders");
+      const wrap = document.createElement("div");
+      wrap.className = "action-table-wrap";
+      const table = document.createElement("table");
+      table.className = "action-table";
+      const thead = document.createElement("thead");
+      thead.innerHTML = "<tr><th>Select</th><th>Order</th><th>Client</th><th>Status</th><th>Lines</th></tr>";
+      const tbody = document.createElement("tbody");
+      state.orders.forEach((row) => {
+        const tr = document.createElement("tr");
+        const orderNo = row.order || "";
+        tr.innerHTML = `<td></td><td>${orderNo}</td><td>${row.client_id || ""}</td><td>${row.status || ""}</td><td>${row.number_of_lines || 0}</td>`;
+        const cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.checked = state.selectedOrders.includes(orderNo);
+        cb.addEventListener("change", () => {
+          if (cb.checked) {
+            if (!state.selectedOrders.includes(orderNo)) state.selectedOrders.push(orderNo);
+          } else {
+            state.selectedOrders = state.selectedOrders.filter((o) => o !== orderNo);
+          }
+          setActiveActionState(state);
+        });
+        tr.children[0].appendChild(cb);
+        tbody.appendChild(tr);
+      });
+      table.appendChild(thead);
+      table.appendChild(tbody);
+      wrap.appendChild(table);
+      resultsCard.appendChild(wrap);
+
+      const nextRow = document.createElement("div");
+      nextRow.className = "action-row";
+      nextRow.appendChild(makeActionButton("Next: Select Lines", "btn-create", async () => {
+        if (state.selectedOrders.length === 0) {
+          setActionStatus("Select at least one order first.", "error");
+          return;
+        }
+        try {
+          const params = new URLSearchParams();
+          params.set("orders", state.selectedOrders.join(","));
+          const res = await fetch(`${API_BASE}/actions/allocate/lines?${params.toString()}`);
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.error || "Failed to load order lines");
+          state.lines = data.rows || [];
+          state.selectedLines = [];
+          state.qtyByLine = {};
+          state.lines.forEach((line) => {
+            const key = `${line.order}::${line.line_id}`;
+            const remaining = Number(line.qty_remaining || 0);
+            state.qtyByLine[key] = remaining > 0 ? String(remaining) : "0";
+          });
+          state.step = 2;
+          setActiveActionState(state);
+          await renderAllocateAction();
+        } catch (err) {
+          setActionStatus(err.message || "Failed to load lines", "error");
+        }
+      }));
+      resultsCard.appendChild(nextRow);
+      actionBody.appendChild(resultsCard);
+    }
+    return;
+  }
+
+  if (state.step === 2) {
+    const linesCard = makeActionCard("Step 2: Select Order Lines and Qty to Allocate");
+    const wrap = document.createElement("div");
+    wrap.className = "action-table-wrap";
+    const table = document.createElement("table");
+    table.className = "action-table";
+    table.innerHTML = "<thead><tr><th>Select</th><th>Order</th><th>Line</th><th>Client</th><th>SKU</th><th>Qty Ordered</th><th>Qty Allocated</th><th>Qty Remaining</th><th>Qty To Allocate</th></tr></thead>";
+    const tbody = document.createElement("tbody");
+    state.lines.forEach((line) => {
+      const key = `${line.order}::${line.line_id}`;
+      const tr = document.createElement("tr");
+      tr.innerHTML = `<td></td><td>${line.order || ""}</td><td>${line.line_id || ""}</td><td>${line.client_id || ""}</td><td>${line.sku || ""}</td><td>${line.qty_ordered || 0}</td><td>${line.qty_allocated || 0}</td><td>${line.qty_remaining || 0}</td><td></td>`;
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.checked = state.selectedLines.includes(key);
+      cb.addEventListener("change", () => {
+        if (cb.checked) {
+          if (!state.selectedLines.includes(key)) state.selectedLines.push(key);
+        } else {
+          state.selectedLines = state.selectedLines.filter((k) => k !== key);
+        }
+        setActiveActionState(state);
+      });
+      tr.children[0].appendChild(cb);
+
+      const qtyInput = document.createElement("input");
+      qtyInput.type = "number";
+      qtyInput.min = "0";
+      qtyInput.value = state.qtyByLine[key] || "0";
+      qtyInput.addEventListener("input", () => {
+        state.qtyByLine[key] = qtyInput.value;
+        setActiveActionState(state);
+      });
+      tr.children[8].appendChild(qtyInput);
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    wrap.appendChild(table);
+    linesCard.appendChild(wrap);
+
+    const nav = document.createElement("div");
+    nav.className = "action-row";
+    nav.appendChild(makeActionButton("Back", "btn-secondary", async () => {
+      state.step = 1;
+      setActiveActionState(state);
+      await renderAllocateAction();
+    }));
+    nav.appendChild(makeActionButton("Next: Ship Dock", "btn-create", async () => {
+      const selected = state.selectedLines.filter((k) => Number(state.qtyByLine[k] || 0) > 0);
+      if (selected.length === 0) {
+        setActionStatus("Select at least one line with a qty greater than 0.", "error");
+        return;
+      }
+      const selectedRows = state.lines.filter((line) => selected.includes(`${line.order}::${line.line_id}`));
+      const clients = Array.from(new Set(selectedRows.map((r) => r.client_id).filter(Boolean)));
+      if (clients.length !== 1) {
+        setActionStatus("Allocate currently supports one client at a time. Filter/select one client.", "error");
+        return;
+      }
+      state.selectedClientId = clients[0];
+      try {
+        const res = await fetch(`${API_BASE}/actions/allocate/ship-docks?client_id=${encodeURIComponent(state.selectedClientId)}`);
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || "Failed to load ship docks");
+        state.shipDockOptions = data.rows || [];
+        state.shipDock = "";
+        state.step = 3;
+        setActiveActionState(state);
+        await renderAllocateAction();
+      } catch (err) {
+        setActionStatus(err.message || "Failed to load ship docks", "error");
+      }
+    }));
+    linesCard.appendChild(nav);
+    actionBody.appendChild(linesCard);
+    return;
+  }
+
+  if (state.step === 3) {
+    const dockCard = makeActionCard("Step 3: Select Ship Dock and Allocate");
+    const row = document.createElement("div");
+    row.className = "action-row";
+    const dockField = document.createElement("div");
+    dockField.className = "query-field";
+    const dockLabel = document.createElement("label");
+    dockLabel.textContent = `Ship Dock (${state.selectedClientId})`;
+    const dockSelect = document.createElement("select");
+    const emptyOpt = document.createElement("option");
+    emptyOpt.value = "";
+    emptyOpt.textContent = "— Select —";
+    dockSelect.appendChild(emptyOpt);
+    (state.shipDockOptions || []).forEach((rowOpt) => {
+      const opt = document.createElement("option");
+      opt.value = rowOpt.location;
+      opt.textContent = rowOpt.location;
+      if (state.shipDock === rowOpt.location) opt.selected = true;
+      dockSelect.appendChild(opt);
+    });
+    dockSelect.addEventListener("change", () => {
+      state.shipDock = dockSelect.value;
+      setActiveActionState(state);
+    });
+    dockField.appendChild(dockLabel);
+    dockField.appendChild(dockSelect);
+    row.appendChild(dockField);
+    dockCard.appendChild(row);
+
+    const nav = document.createElement("div");
+    nav.className = "action-row";
+    nav.appendChild(makeActionButton("Back", "btn-secondary", async () => {
+      state.step = 2;
+      setActiveActionState(state);
+      await renderAllocateAction();
+    }));
+    nav.appendChild(makeActionButton("Allocate Selected Lines", "btn-create", async () => {
+      if (!state.shipDock) {
+        setActionStatus("Select a ship dock first.", "error");
+        return;
+      }
+      const selected = state.selectedLines.filter((k) => Number(state.qtyByLine[k] || 0) > 0);
+      const linesPayload = selected.map((key) => {
+        const ids = parseLineKey(key);
+        return { ...ids, qty: Number(state.qtyByLine[key] || 0) };
+      });
+      try {
+        const res = await fetch(`${API_BASE}/actions/allocate`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            ship_dock: state.shipDock,
+            lines: linesPayload,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || "Allocation failed");
+        state.result = data;
+        state.step = 4;
+        setActiveActionState(state);
+        await renderAllocateAction();
+      } catch (err) {
+        setActionStatus(err.message || "Allocation failed", "error");
+      }
+    }));
+    dockCard.appendChild(nav);
+    actionBody.appendChild(dockCard);
+    return;
+  }
+
+  const doneCard = makeActionCard("Allocation Completed");
+  const summary = document.createElement("p");
+  const done = state.result || {};
+  summary.textContent = `Allocated lines: ${done.allocated_lines || 0}. Updated orders: ${done.updated_orders || 0}.`;
+  doneCard.appendChild(summary);
+  doneCard.appendChild(makeActionButton("Start New Allocation", "btn-create", async () => {
+    await renderActionTab("allocate", null);
+  }));
+  actionBody.appendChild(doneCard);
+}
+
+async function renderPickAction() {
+  const state = actionState || defaultActionState("pick");
+  setActiveActionState(state);
+  clearNode(actionBody);
+
+  if (state.step === 1) {
+    const card = makeActionCard("Step 1: Enter Order Number");
+    const row = document.createElement("div");
+    row.className = "action-row";
+    const orderField = makeActionInput("Order", state.order, (val) => {
+      state.order = val.trim();
+      setActiveActionState(state);
+    });
+    row.appendChild(orderField.wrap);
+    row.appendChild(makeActionButton("Start Picking", "btn-create", async () => {
+      if (!state.order) {
+        setActionStatus("Enter an order number first.", "error");
+        return;
+      }
+      try {
+        const res = await fetch(`${API_BASE}/actions/pick/order?order=${encodeURIComponent(state.order)}`);
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || "Failed to load order lines");
+        state.lines = data.lines || [];
+        state.currentIndex = 0;
+        state.resultLines = [];
+        state.step = 2;
+        setActiveActionState(state);
+        await renderPickAction();
+      } catch (err) {
+        setActionStatus(err.message || "Failed to load order lines", "error");
+      }
+    }));
+    card.appendChild(row);
+    actionBody.appendChild(card);
+    return;
+  }
+
+  if (state.step === 2) {
+    if (!state.lines.length || state.currentIndex >= state.lines.length) {
+      state.step = 3;
+      setActiveActionState(state);
+      await renderPickAction();
+      return;
+    }
+
+    const line = state.lines[state.currentIndex];
+    const card = makeActionCard(`Step 2: Pick Line ${state.currentIndex + 1} of ${state.lines.length}`);
+    const info = document.createElement("p");
+    info.textContent = `Order ${line.order}, line ${line.line_id}, SKU ${line.sku}. Requested: ${line.qty_ordered || 0}, Picked so far: ${line.qty_picked || 0}, To pick now: ${line.remaining_to_pick || 0}.`;
+    card.appendChild(info);
+
+    const formRow = document.createElement("div");
+    formRow.className = "action-row";
+    const locField = document.createElement("div");
+    locField.className = "query-field";
+    const locLabel = document.createElement("label");
+    locLabel.textContent = "Pick Location";
+    const locSelect = document.createElement("select");
+    const empty = document.createElement("option");
+    empty.value = "";
+    empty.textContent = "— Select —";
+    locSelect.appendChild(empty);
+    (line.locations || []).forEach((loc) => {
+      const opt = document.createElement("option");
+      opt.value = loc.location;
+      opt.textContent = `${loc.location} (alloc ${loc.qty_allocated || 0}, avail ${loc.qty_available || 0})`;
+      locSelect.appendChild(opt);
+    });
+    locField.appendChild(locLabel);
+    locField.appendChild(locSelect);
+    formRow.appendChild(locField);
+
+    const qtyField = document.createElement("div");
+    qtyField.className = "query-field";
+    const qtyLabel = document.createElement("label");
+    qtyLabel.textContent = "Qty Picked";
+    const qtyInput = document.createElement("input");
+    qtyInput.type = "number";
+    qtyInput.min = "0";
+    qtyInput.value = String(line.remaining_to_pick || 0);
+    qtyField.appendChild(qtyLabel);
+    qtyField.appendChild(qtyInput);
+    formRow.appendChild(qtyField);
+    card.appendChild(formRow);
+
+    const nav = document.createElement("div");
+    nav.className = "action-row";
+    nav.appendChild(makeActionButton("Pick and Next", "btn-create", async () => {
+      const location = locSelect.value;
+      const qty = Number(qtyInput.value || 0);
+      if (!location) {
+        setActionStatus("Select a location.", "error");
+        return;
+      }
+      if (!Number.isFinite(qty) || qty <= 0) {
+        setActionStatus("Enter a valid pick quantity.", "error");
+        return;
+      }
+      try {
+        const res = await fetch(`${API_BASE}/actions/pick`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            order: line.order,
+            line_id: line.line_id,
+            location,
+            qty,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || "Pick failed");
+
+        if (Number(data.location_qty_after || 0) <= 0) {
+          const hasMore = confirm(`System now shows 0 left in ${location}. Is there still stock in that location?`);
+          if (hasMore) {
+            const raw = prompt("Enter counted qty left in location:", "0");
+            const countedQty = Number(raw || 0);
+            if (Number.isFinite(countedQty) && countedQty >= 0) {
+              const adjRes = await fetch(`${API_BASE}/actions/pick/stock-adjust`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  location,
+                  client_id: line.client_id,
+                  sku: line.sku,
+                  counted_qty: countedQty,
+                }),
+              });
+              const adj = await adjRes.json();
+              if (!adjRes.ok) throw new Error(adj.error || "Stock adjustment failed");
+            }
+          }
+        }
+
+        state.resultLines.push(`Order ${line.order} line ${line.line_id}: picked ${qty} from ${location}`);
+        state.currentIndex += 1;
+        setActiveActionState(state);
+        await renderPickAction();
+      } catch (err) {
+        setActionStatus(err.message || "Pick failed", "error");
+      }
+    }));
+    card.appendChild(nav);
+    actionBody.appendChild(card);
+    return;
+  }
+
+  const done = makeActionCard("Picking Completed");
+  const ul = document.createElement("ul");
+  (state.resultLines || []).forEach((txt) => {
+    const li = document.createElement("li");
+    li.textContent = txt;
+    ul.appendChild(li);
+  });
+  done.appendChild(ul);
+  done.appendChild(makeActionButton("Pick Another Order", "btn-create", async () => {
+    await renderActionTab("pick", null);
+  }));
+  actionBody.appendChild(done);
+}
+
+async function renderStockCheckAction() {
+  const state = actionState || defaultActionState("stock_check");
+  setActiveActionState(state);
+  clearNode(actionBody);
+
+  if (state.step === 1) {
+    const card = makeActionCard("Step 1: Scan Location Twice");
+    const row = document.createElement("div");
+    row.className = "action-row";
+    const locA = makeActionInput("Location Scan 1", state.locationA, (val) => {
+      state.locationA = val.trim();
+      setActiveActionState(state);
+    });
+    const locB = makeActionInput("Location Scan 2", state.locationB, (val) => {
+      state.locationB = val.trim();
+      setActiveActionState(state);
+    });
+    row.appendChild(locA.wrap);
+    row.appendChild(locB.wrap);
+    row.appendChild(makeActionButton("Load Expected Stock", "btn-create", async () => {
+      if (!state.locationA || !state.locationB) {
+        setActionStatus("Scan both location fields.", "error");
+        return;
+      }
+      if (state.locationA !== state.locationB) {
+        setActionStatus("Locations do not match. Re-scan.", "error");
+        return;
+      }
+      try {
+        const res = await fetch(`${API_BASE}/actions/stock-check/location?location=${encodeURIComponent(state.locationA)}`);
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || "Failed to load location stock");
+        state.items = data.items || [];
+        state.countedByKey = {};
+        state.items.forEach((item) => {
+          const key = `${item.client_id}::${item.sku}`;
+          state.countedByKey[key] = String(item.current_qty || 0);
+        });
+        state.step = 2;
+        setActiveActionState(state);
+        await renderStockCheckAction();
+      } catch (err) {
+        setActionStatus(err.message || "Failed to load location stock", "error");
+      }
+    }));
+    card.appendChild(row);
+    actionBody.appendChild(card);
+    return;
+  }
+
+  const card = makeActionCard(`Step 2: Counted Qty at ${state.locationA}`);
+  if (!state.items.length) {
+    const empty = document.createElement("p");
+    empty.textContent = "No SKU currently recorded in this location.";
+    card.appendChild(empty);
+  } else {
+    const wrap = document.createElement("div");
+    wrap.className = "action-table-wrap";
+    const table = document.createElement("table");
+    table.className = "action-table";
+    table.innerHTML = "<thead><tr><th>Client</th><th>SKU</th><th>System Qty</th><th>Counted Qty</th></tr></thead>";
+    const tbody = document.createElement("tbody");
+    state.items.forEach((item) => {
+      const key = `${item.client_id}::${item.sku}`;
+      const tr = document.createElement("tr");
+      tr.innerHTML = `<td>${item.client_id || ""}</td><td>${item.sku || ""}</td><td>${item.current_qty || 0}</td><td></td>`;
+      const input = document.createElement("input");
+      input.type = "number";
+      input.value = state.countedByKey[key] || "0";
+      input.addEventListener("input", () => {
+        state.countedByKey[key] = input.value;
+        setActiveActionState(state);
+      });
+      tr.children[3].appendChild(input);
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    wrap.appendChild(table);
+    card.appendChild(wrap);
+  }
+
+  const nav = document.createElement("div");
+  nav.className = "action-row";
+  nav.appendChild(makeActionButton("Back", "btn-secondary", async () => {
+    state.step = 1;
+    setActiveActionState(state);
+    await renderStockCheckAction();
+  }));
+  nav.appendChild(makeActionButton("Apply Stock Check", "btn-create", async () => {
+    const counts = state.items.map((item) => {
+      const key = `${item.client_id}::${item.sku}`;
+      return {
+        client_id: item.client_id,
+        sku: item.sku,
+        counted_qty: Number(state.countedByKey[key] || 0),
+      };
+    });
+    try {
+      const res = await fetch(`${API_BASE}/actions/stock-check`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          location: state.locationA,
+          counts,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Stock check failed");
+      setActionStatus(`Stock check applied. Adjusted ${data.updated || 0} SKU row(s).`, "success");
+    } catch (err) {
+      setActionStatus(err.message || "Stock check failed", "error");
+    }
+  }));
+  card.appendChild(nav);
+  actionBody.appendChild(card);
+}
 
 // ── KPI Dashboard ──────────────────────────────────────────────
 function getCurrentMonth() {
@@ -2776,6 +3556,8 @@ kpiNavBtn.addEventListener("click", () => {
   if (activeTabId) saveTabState();
   activeTabId = null;
   activeTable = null;
+  activeActionKey = null;
+  actionState = null;
   showKpiPage();
   renderTabBar();
 });
