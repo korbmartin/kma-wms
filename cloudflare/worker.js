@@ -1930,6 +1930,7 @@ async function applyStockCheckDelta(supabase, payload) {
 
   let totalAvail = 0;
   let totalAlloc = 0;
+  const previousSuspense = intFloor(invRows[0]?.suspense, 0);
   invRows.forEach((r) => {
     totalAvail += intFloor(r.qty_available, 0);
     totalAlloc += intFloor(r.qty_allocated, 0);
@@ -1937,6 +1938,7 @@ async function applyStockCheckDelta(supabase, payload) {
 
   const currentQty = totalAvail + totalAlloc;
   const delta = countedQty - currentQty;
+  const nextSuspense = previousSuspense + delta;
   const newAllocTotal = Math.min(totalAlloc, countedQty);
   const newAvailTotal = countedQty - newAllocTotal;
 
@@ -1970,7 +1972,7 @@ async function applyStockCheckDelta(supabase, payload) {
 
     const upd = { qty_allocated: rowAlloc, qty_available: rowAvail };
     if (hasSuspenseCol) {
-      upd.suspense = delta;
+      upd.suspense = nextSuspense;
     }
     const { error: updErr } = await supabase.from("inventory").update(upd).eq("id", row.id);
     if (updErr) throw updErr;
@@ -2129,7 +2131,7 @@ async function handleStockCheckUp(supabase, request) {
       const nextAvail = intFloor(firstRow.qty_available, 0) + updateQty;
       const updPayload = { qty_available: nextAvail };
       if (tagId) updPayload.tag_id = tagId;
-      if (hasSuspenseCol) updPayload.suspense = updateQty;
+      if (hasSuspenseCol) updPayload.suspense = intFloor(firstRow.suspense, 0) + updateQty;
 
       const { error: updErr } = await supabase.from("inventory").update(updPayload).eq("id", firstRow.id);
       if (updErr) throw updErr;
