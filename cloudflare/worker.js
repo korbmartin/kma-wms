@@ -1383,16 +1383,7 @@ async function handleAllocate(supabase, request) {
   }
   const shipDockRow = shipDockRows[0];
 
-  const lineCols = await getTableColumnSet(supabase, "order_lines");
-  if (!lineCols.has("ship_dock")) {
-    return responseJson(
-      {
-        error:
-          "order_lines.ship_dock column is missing. Run: ALTER TABLE order_lines ADD COLUMN ship_dock VARCHAR(100);",
-      },
-      400
-    );
-  }
+  const hasShipDockColumn = await tableHasColumn(supabase, "order_lines", "ship_dock");
 
   let allocatedLines = 0;
   const updatedOrders = new Set();
@@ -1504,9 +1495,14 @@ async function handleAllocate(supabase, request) {
       }
 
       const newLineAlloc = qtyAllocated + qtyToAllocate;
+      const lineUpdate = { qty_allocated: newLineAlloc };
+      if (hasShipDockColumn) {
+        lineUpdate.ship_dock = shipDock;
+      }
+
       const { error: lineErr } = await supabase
         .from("order_lines")
-        .update({ qty_allocated: newLineAlloc, ship_dock: shipDock })
+        .update(lineUpdate)
         .eq(pgCol("order"), orderNum)
         .eq("line_id", lineId);
       if (lineErr) throw lineErr;
@@ -1545,6 +1541,7 @@ async function handleAllocate(supabase, request) {
     updated_orders: updatedOrderCount,
     shortages,
     errors,
+    warnings: hasShipDockColumn ? [] : ["order_lines.ship_dock is not available in Supabase schema cache; allocation completed without saving ship dock to order_lines."],
   });
 }
 
@@ -1552,11 +1549,16 @@ async function handlePickOrderLoad(supabase, searchParams) {
   const orderNum = String(searchParams.get("order") || "").trim();
   if (!orderNum) return responseJson({ error: "Missing order query parameter" }, 400);
 
+  const hasShipDockColumn = await tableHasColumn(supabase, "order_lines", "ship_dock");
+  const selectCols = hasShipDockColumn
+    ? "\"order\",line_id,client_id,sku,qty_ordered,qty_allocated,qty_picked,ship_dock"
+    : "\"order\",line_id,client_id,sku,qty_ordered,qty_allocated,qty_picked";
+
   const lines = await fetchAllRows(
     () =>
       supabase
         .from("order_lines")
-        .select("\"order\",line_id,client_id,sku,qty_ordered,qty_allocated,qty_picked,ship_dock")
+        .select(selectCols)
         .eq(pgCol("order"), orderNum)
         .order("line_id", { ascending: true }),
     1000,
@@ -1589,6 +1591,7 @@ async function handlePickOrderLoad(supabase, searchParams) {
 
     resultLines.push({
       ...line,
+      ship_dock: hasShipDockColumn ? line.ship_dock : null,
       qty_ordered: qtyOrdered,
       qty_allocated: qtyAllocated,
       qty_picked: qtyPicked,
