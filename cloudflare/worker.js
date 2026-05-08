@@ -404,6 +404,27 @@ async function getTableColumnSet(supabase, tableName) {
   return new Set((columns || []).map((c) => c.column_name));
 }
 
+async function tableHasColumn(supabase, tableName, columnName) {
+  if (!isValidColumnName(columnName)) return false;
+  const { error } = await supabase.from(tableName).select(pgCol(columnName)).limit(1);
+  if (!error) return true;
+
+  const msg = sanitizeMessage(error).toLowerCase();
+  const col = columnName.toLowerCase();
+  if (
+    msg.includes(`column '${col}'`) ||
+    msg.includes(`column "${col}"`) ||
+    msg.includes(`column ${col}`) ||
+    msg.includes("does not exist") ||
+    msg.includes("could not find")
+  ) {
+    return false;
+  }
+
+  // Avoid false negatives on permission/exposure quirks.
+  return true;
+}
+
 async function fetchOneByPk(supabase, tableName, pks, pkValues, columns = "*") {
   let query = supabase.from(tableName).select(columns).limit(1);
   query = applyPkFilters(query, pks, pkValues);
@@ -1813,8 +1834,7 @@ async function applyStockCheckDelta(supabase, payload) {
   const newAllocTotal = Math.min(totalAlloc, countedQty);
   const newAvailTotal = countedQty - newAllocTotal;
 
-  const invCols = await getTableColumnSet(supabase, "inventory");
-  const hasSuspenseCol = invCols.has("suspense");
+  const hasSuspenseCol = await tableHasColumn(supabase, "inventory", "suspense");
   if (!hasSuspenseCol) {
     throw new Error("inventory.suspense column is missing. Run db/add_action_columns.sql in Supabase.");
   }
@@ -1850,8 +1870,8 @@ async function applyStockCheckDelta(supabase, payload) {
     if (updErr) throw updErr;
   }
 
-  const txnCols = await getTableColumnSet(supabase, "inventory_transaction");
-  if (!txnCols.has("update_qty")) {
+  const hasUpdateQtyCol = await tableHasColumn(supabase, "inventory_transaction", "update_qty");
+  if (!hasUpdateQtyCol) {
     throw new Error("inventory_transaction.update_qty column is missing. Run db/add_action_columns.sql in Supabase.");
   }
   const txnPayload = {
@@ -1923,16 +1943,15 @@ async function handleStockCheckUp(supabase, request) {
   if (!rows.length) return responseJson({ error: "rows is required" }, 400);
   if (rows.length > 5000) return responseJson({ error: "Maximum 5000 rows per request" }, 400);
 
-  const inventoryCols = await getTableColumnSet(supabase, "inventory");
-  const txnCols = await getTableColumnSet(supabase, "inventory_transaction");
-  const hasSuspenseCol = inventoryCols.has("suspense");
+  const hasSuspenseCol = await tableHasColumn(supabase, "inventory", "suspense");
   if (!hasSuspenseCol) {
     return responseJson(
       { error: "inventory.suspense column is missing. Run db/add_action_columns.sql in Supabase." },
       400
     );
   }
-  if (!txnCols.has("update_qty")) {
+  const hasUpdateQtyCol = await tableHasColumn(supabase, "inventory_transaction", "update_qty");
+  if (!hasUpdateQtyCol) {
     return responseJson(
       { error: "inventory_transaction.update_qty column is missing. Run db/add_action_columns.sql in Supabase." },
       400
