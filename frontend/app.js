@@ -585,6 +585,7 @@ function openTab(table, filters) {
 }
 
 function openActionTab(actionKey) {
+  const originTabId = activeTabId;
   if (tabs.length >= MAX_TABS) {
     const oldest = tabs.find((t) => t.id !== activeTabId) || tabs[0];
     closeTab(oldest.id);
@@ -601,6 +602,7 @@ function openActionTab(actionKey) {
     kind: "action",
     actionKey,
     actionState: null,
+    originTabId: originTabId || null,
     label,
   };
 
@@ -2818,6 +2820,39 @@ function getActiveTab() {
   return tabs.find((t) => t.id === activeTabId) || null;
 }
 
+async function returnToOriginAfterAction(successMessage) {
+  const current = getActiveTab();
+  const currentId = current ? current.id : null;
+  const originId = current && current.kind === "action" ? current.originTabId : null;
+
+  if (successMessage) {
+    alert(successMessage);
+  }
+
+  if (!currentId) return;
+
+  const currentIdx = tabs.findIndex((t) => t.id === currentId);
+  if (currentIdx >= 0) {
+    tabs.splice(currentIdx, 1);
+  }
+
+  if (originId && tabs.some((t) => t.id === originId)) {
+    const originTab = tabs.find((t) => t.id === originId);
+    if (originTab) {
+      await restoreTabState(originTab);
+      renderTabBar();
+      return;
+    }
+  }
+
+  activeTabId = null;
+  activeTable = null;
+  activeActionKey = null;
+  actionState = null;
+  showKpiPage();
+  renderTabBar();
+}
+
 function setActiveActionState(nextState) {
   actionState = nextState;
   const tab = getActiveTab();
@@ -3307,6 +3342,43 @@ async function renderAllocateAction() {
   const done = state.result || {};
   summary.textContent = `Allocated lines: ${done.allocated_lines || 0}. Updated orders: ${done.updated_orders || 0}.`;
   doneCard.appendChild(summary);
+
+  if (Array.isArray(done.shortages) && done.shortages.length > 0) {
+    const shortageTitle = document.createElement("p");
+    shortageTitle.style.marginTop = "0.8rem";
+    shortageTitle.textContent = "Unsuccessful / partial allocations:";
+    doneCard.appendChild(shortageTitle);
+
+    const wrap = document.createElement("div");
+    wrap.className = "action-table-wrap";
+    const table = document.createElement("table");
+    table.className = "action-table";
+    table.innerHTML = "<thead><tr><th>Order</th><th>Line</th><th>SKU</th><th>Requested</th><th>Allocated</th><th>Unallocated</th><th>Reason</th></tr></thead>";
+    const tbody = document.createElement("tbody");
+    done.shortages.forEach((s) => {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `<td>${s.order || ""}</td><td>${s.line_id || ""}</td><td>${s.sku || ""}</td><td>${s.requested_qty ?? ""}</td><td>${s.allocated_qty ?? ""}</td><td>${s.unallocated_qty ?? ""}</td><td>${s.reason || ""}</td>`;
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    wrap.appendChild(table);
+    doneCard.appendChild(wrap);
+  }
+
+  if (Array.isArray(done.errors) && done.errors.length > 0) {
+    const errTitle = document.createElement("p");
+    errTitle.style.marginTop = "0.8rem";
+    errTitle.textContent = "Lines with errors:";
+    doneCard.appendChild(errTitle);
+    const ul = document.createElement("ul");
+    done.errors.forEach((e) => {
+      const li = document.createElement("li");
+      li.textContent = `Row ${e.row || "?"}: ${e.error || "Unknown error"}`;
+      ul.appendChild(li);
+    });
+    doneCard.appendChild(ul);
+  }
+
   doneCard.appendChild(makeActionButton("Start New Allocation", "btn-create", async () => {
     await renderActionTab("allocate", null);
   }));
@@ -3353,9 +3425,7 @@ async function renderPickAction() {
 
   if (state.step === 2) {
     if (!state.lines.length || state.currentIndex >= state.lines.length) {
-      state.step = 3;
-      setActiveActionState(state);
-      await renderPickAction();
+      await returnToOriginAfterAction("Pick workflow completed successfully.");
       return;
     }
 
@@ -3461,18 +3531,7 @@ async function renderPickAction() {
     return;
   }
 
-  const done = makeActionCard("Picking Completed");
-  const ul = document.createElement("ul");
-  (state.resultLines || []).forEach((txt) => {
-    const li = document.createElement("li");
-    li.textContent = txt;
-    ul.appendChild(li);
-  });
-  done.appendChild(ul);
-  done.appendChild(makeActionButton("Pick Another Order", "btn-create", async () => {
-    await renderActionTab("pick", null);
-  }));
-  actionBody.appendChild(done);
+  await returnToOriginAfterAction("Pick workflow completed successfully.");
 }
 
 async function renderStockCheckAction() {
@@ -3643,7 +3702,7 @@ async function renderStockCheckAction() {
         });
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || "Stock check up failed");
-        setActionStatus(`Stock check up applied. Updated ${data.updated || 0} row(s).`, "success");
+        await returnToOriginAfterAction(`Stock check up applied. Updated ${data.updated || 0} row(s).`);
       } catch (err) {
         setActionStatus(err.message || "Stock check up failed", "error");
       }
@@ -3703,7 +3762,7 @@ async function renderStockCheckAction() {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Stock check failed");
-      setActionStatus(`Stock check applied. Adjusted ${data.updated || 0} SKU row(s).`, "success");
+      await returnToOriginAfterAction(`Stock check applied. Adjusted ${data.updated || 0} SKU row(s).`);
     } catch (err) {
       setActionStatus(err.message || "Stock check failed", "error");
     }

@@ -1375,6 +1375,7 @@ async function handleAllocate(supabase, request) {
 
   let allocatedLines = 0;
   const updatedOrders = new Set();
+  const shortages = [];
   const errors = [];
 
   for (let i = 0; i < lines.length; i++) {
@@ -1405,8 +1406,18 @@ async function handleAllocate(supabase, request) {
       const qtyOrdered = intFloor(line.qty_ordered, 0);
       const qtyAllocated = intFloor(line.qty_allocated, 0);
       const remaining = Math.max(qtyOrdered - qtyAllocated, 0);
-      if (qtyReq > remaining) {
-        throw new Error(`Requested qty ${qtyReq} exceeds remaining allocatable qty ${remaining}`);
+      const targetQty = Math.min(qtyReq, remaining);
+      if (targetQty <= 0) {
+        shortages.push({
+          order: orderNum,
+          line_id: lineId,
+          sku: line.sku,
+          requested_qty: qtyReq,
+          allocated_qty: 0,
+          unallocated_qty: qtyReq,
+          reason: "Line is already fully allocated",
+        });
+        continue;
       }
 
       const invRows = await fetchAllRows(
@@ -1426,11 +1437,21 @@ async function handleAllocate(supabase, request) {
       invRows.forEach((r) => {
         availableTotal += intFloor(r.qty_available, 0);
       });
-      if (availableTotal < qtyReq) {
-        throw new Error(`Not enough available stock for SKU '${line.sku}'. Needed ${qtyReq}, available ${availableTotal}.`);
+      const qtyToAllocate = Math.min(targetQty, Math.max(availableTotal, 0));
+      if (qtyToAllocate <= 0) {
+        shortages.push({
+          order: orderNum,
+          line_id: lineId,
+          sku: line.sku,
+          requested_qty: qtyReq,
+          allocated_qty: 0,
+          unallocated_qty: qtyReq,
+          reason: "No stock available",
+        });
+        continue;
       }
 
-      let remainingToAllocate = qtyReq;
+      let remainingToAllocate = qtyToAllocate;
       for (const inv of invRows) {
         if (remainingToAllocate <= 0) break;
         const avail = intFloor(inv.qty_available, 0);
@@ -1461,7 +1482,7 @@ async function handleAllocate(supabase, request) {
         remainingToAllocate -= take;
       }
 
-      const newLineAlloc = qtyAllocated + qtyReq;
+      const newLineAlloc = qtyAllocated + qtyToAllocate;
       const { error: lineErr } = await supabase
         .from("order_lines")
         .update({ qty_allocated: newLineAlloc, ship_dock: shipDock })
@@ -1471,6 +1492,21 @@ async function handleAllocate(supabase, request) {
 
       allocatedLines += 1;
       updatedOrders.add(orderNum);
+
+      const unallocatedQty = Math.max(qtyReq - qtyToAllocate, 0);
+      if (unallocatedQty > 0) {
+        shortages.push({
+          order: orderNum,
+          line_id: lineId,
+          sku: line.sku,
+          requested_qty: qtyReq,
+          allocated_qty: qtyToAllocate,
+          unallocated_qty: unallocatedQty,
+          reason: availableTotal < targetQty
+            ? `Insufficient stock (available ${availableTotal}, requested ${qtyReq})`
+            : `Requested qty exceeded remaining line qty (${remaining})`,
+        });
+      }
     } catch (err) {
       errors.push({ row: i + 1, error: sanitizeMessage(err), line: req });
     }
@@ -1482,14 +1518,11 @@ async function handleAllocate(supabase, request) {
     updatedOrderCount += 1;
   }
 
-  if (allocatedLines === 0) {
-    return responseJson({ error: "No lines were allocated", allocated_lines: 0, updated_orders: 0, errors }, 400);
-  }
-
   return responseJson({
-    success: true,
+    success: allocatedLines > 0,
     allocated_lines: allocatedLines,
     updated_orders: updatedOrderCount,
+    shortages,
     errors,
   });
 }
@@ -1782,6 +1815,9 @@ async function applyStockCheckDelta(supabase, payload) {
 
   const invCols = await getTableColumnSet(supabase, "inventory");
   const hasSuspenseCol = invCols.has("suspense");
+  if (!hasSuspenseCol) {
+    throw new Error("inventory.suspense column is missing. Run db/add_action_columns.sql in Supabase.");
+  }
 
   let remAlloc = newAllocTotal;
   let remAvail = newAvailTotal;
@@ -1815,6 +1851,9 @@ async function applyStockCheckDelta(supabase, payload) {
   }
 
   const txnCols = await getTableColumnSet(supabase, "inventory_transaction");
+  if (!txnCols.has("update_qty")) {
+    throw new Error("inventory_transaction.update_qty column is missing. Run db/add_action_columns.sql in Supabase.");
+  }
   const txnPayload = {
     code: "Stock check",
     type: "Location Stock Check",
@@ -1825,9 +1864,7 @@ async function applyStockCheckDelta(supabase, payload) {
     description: `Stock check at ${location}: system ${currentQty}, counted ${countedQty}, delta ${delta >= 0 ? "+" : ""}${delta}`,
     status: "Checked",
   };
-  if (txnCols.has("update_qty")) {
-    txnPayload.update_qty = delta;
-  }
+  txnPayload.update_qty = delta;
   const { error: txErr } = await supabase.from("inventory_transaction").insert(txnPayload);
   if (txErr) throw txErr;
 
@@ -1889,6 +1926,18 @@ async function handleStockCheckUp(supabase, request) {
   const inventoryCols = await getTableColumnSet(supabase, "inventory");
   const txnCols = await getTableColumnSet(supabase, "inventory_transaction");
   const hasSuspenseCol = inventoryCols.has("suspense");
+  if (!hasSuspenseCol) {
+    return responseJson(
+      { error: "inventory.suspense column is missing. Run db/add_action_columns.sql in Supabase." },
+      400
+    );
+  }
+  if (!txnCols.has("update_qty")) {
+    return responseJson(
+      { error: "inventory_transaction.update_qty column is missing. Run db/add_action_columns.sql in Supabase." },
+      400
+    );
+  }
 
   let updated = 0;
   const errors = [];
@@ -1967,7 +2016,7 @@ async function handleStockCheckUp(supabase, request) {
         status: "Checked",
       };
       if (tagId) txnPayload.tag_id = tagId;
-      if (txnCols.has("update_qty")) txnPayload.update_qty = updateQty;
+      txnPayload.update_qty = updateQty;
 
       const { error: txErr } = await supabase.from("inventory_transaction").insert(txnPayload);
       if (txErr) throw txErr;
