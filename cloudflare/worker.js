@@ -1877,11 +1877,16 @@ async function handlePickLine(supabase, request) {
     return responseJson({ error: `Pick qty ${qty} exceeds remaining qty ${remainingToPick}` }, 400);
   }
 
+  const hasSuspenseCol = await tableHasColumn(supabase, "inventory", "suspense");
+  const invSelectCols = hasSuspenseCol
+    ? "id,location,qty_available,qty_allocated,suspense"
+    : "id,location,qty_available,qty_allocated";
+
   const invRows = await fetchAllRows(
     () =>
       supabase
         .from("inventory")
-        .select("id,location,qty_available,qty_allocated")
+        .select(invSelectCols)
         .eq("client_id", line.client_id)
         .eq("sku", line.sku)
         .eq("location", location)
@@ -1927,6 +1932,7 @@ async function handlePickLine(supabase, request) {
   for (const inv of invRows) {
     const currAlloc = intFloor(inv.qty_allocated, 0);
     const currAvail = intFloor(inv.qty_available, 0);
+    const currSuspense = hasSuspenseCol ? intFloor(inv.suspense, 0) : 0;
     let takeAlloc = 0;
     let takeAvail = 0;
 
@@ -1941,11 +1947,23 @@ async function handlePickLine(supabase, request) {
 
     const newAlloc = currAlloc - takeAlloc;
     const newAvail = currAvail - takeAvail;
+    const consumed = takeAlloc + takeAvail;
     finalLocationQty += newAlloc + newAvail;
+
+    const updatePayload = { qty_allocated: newAlloc, qty_available: newAvail };
+    if (hasSuspenseCol) {
+      let nextSuspense = currSuspense;
+      if (currSuspense > 0) {
+        nextSuspense = Math.max(currSuspense - consumed, 0);
+        const maxPositiveSuspense = Math.max(newAlloc + newAvail, 0);
+        if (nextSuspense > maxPositiveSuspense) nextSuspense = maxPositiveSuspense;
+      }
+      updatePayload.suspense = nextSuspense;
+    }
 
     const { error: updErr } = await supabase
       .from("inventory")
-      .update({ qty_allocated: newAlloc, qty_available: newAvail })
+      .update(updatePayload)
       .eq("id", inv.id);
     if (updErr) throw updErr;
   }
