@@ -1565,6 +1565,10 @@ async function updateOrderHeaderStatusToAllocated(supabase, orderNum) {
   if (!orderNum) return false;
   const oldRow = await fetchOneByPk(supabase, "order_header", ["order"], { order: orderNum }, "status");
   const oldStatus = oldRow ? oldRow.status : null;
+  const oldStatusLower = String(oldStatus || "").toLowerCase();
+  if (oldStatusLower === "picked" || oldStatusLower === "locked") {
+    return false;
+  }
   const { error } = await supabase.from("order_header").update({ status: "Allocated" }).eq(pgCol("order"), orderNum);
   if (error) throw error;
   if (oldStatus !== "Allocated") {
@@ -1885,18 +1889,20 @@ async function setOrderHeaderPickedIfComplete(supabase, orderNum) {
   );
   if (!rows.length) return;
 
-  const hasOutstanding = rows.some((r) => intFloor(r.qty_allocated, 0) - intFloor(r.qty_picked, 0) > 0);
-  if (!hasOutstanding) {
-    const oldRow = await fetchOneByPk(supabase, "order_header", ["order"], { order: orderNum }, "status");
-    const oldStatus = oldRow ? oldRow.status : null;
-    const { error } = await supabase.from("order_header").update({ status: "Picked" }).eq(pgCol("order"), orderNum);
-    if (error) throw error;
-    if (oldStatus !== "Picked") {
-      try {
-        await logStatusChange(supabase, "order_header", { order: orderNum });
-      } catch (logErr) {
-        console.error("Status log error:", sanitizeMessage(logErr));
-      }
+  const hasAnyPickedQty = rows.some((r) => intFloor(r.qty_picked, 0) > 0);
+  if (!hasAnyPickedQty) return;
+
+  const oldRow = await fetchOneByPk(supabase, "order_header", ["order"], { order: orderNum }, "status");
+  const oldStatus = oldRow ? oldRow.status : null;
+  if (String(oldStatus || "").toLowerCase() === "locked") return;
+
+  const { error } = await supabase.from("order_header").update({ status: "Picked" }).eq(pgCol("order"), orderNum);
+  if (error) throw error;
+  if (oldStatus !== "Picked") {
+    try {
+      await logStatusChange(supabase, "order_header", { order: orderNum });
+    } catch (logErr) {
+      console.error("Status log error:", sanitizeMessage(logErr));
     }
   }
 }
