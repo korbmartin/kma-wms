@@ -618,32 +618,15 @@ async function getAllocatedLocationBalancesForOrderLine(supabase, line) {
   const sku = String(line?.sku || "").trim();
   if (!orderNum || !lineId || !clientId || !sku) return new Map();
 
-  const baseQueryFactory = () =>
-    supabase
-      .from("inventory_transaction")
-      .select("location,qty")
-      .eq("client_id", clientId)
-      .eq("sku", sku)
-      .ilike(pgCol("order"), orderNum)
-      .ilike("order_line_id", lineId);
-
-  const allocateRows = await fetchAllRows(
-    () => baseQueryFactory().eq("code", "Allocate").eq("type", "Order Line"),
-    1000,
-    200000
-  );
-  const pickRows = await fetchAllRows(
-    () => baseQueryFactory().eq("code", "Pick").eq("type", "Order Line"),
-    1000,
-    200000
-  );
-  const unpickRows = await fetchAllRows(
-    () => baseQueryFactory().eq("code", "Unpick").eq("type", "Order Line"),
-    1000,
-    200000
-  );
-  const deallocateRows = await fetchAllRows(
-    () => baseQueryFactory().eq("code", "Deallocate").eq("type", "Order Line"),
+  const txRows = await fetchAllRows(
+    () =>
+      supabase
+        .from("inventory_transaction")
+        .select("code,type,location,qty")
+        .eq("client_id", clientId)
+        .eq("sku", sku)
+        .ilike(pgCol("order"), orderNum)
+        .ilike("order_line_id", lineId),
     1000,
     200000
   );
@@ -662,10 +645,32 @@ async function getAllocatedLocationBalancesForOrderLine(supabase, line) {
     balances.set(key, entry);
   };
 
-  allocateRows.forEach((row) => addDelta(row, 1));
-  pickRows.forEach((row) => addDelta(row, -1));
-  unpickRows.forEach((row) => addDelta(row, 1));
-  deallocateRows.forEach((row) => addDelta(row, -1));
+  txRows.forEach((row) => {
+    const code = String(row?.code || "").trim().toLowerCase();
+    const type = String(row?.type || "").trim().toLowerCase();
+
+    if (code === "allocate" && type === "order line") {
+      addDelta(row, 1);
+      return;
+    }
+    if (code === "pick" && type === "order line") {
+      addDelta(row, -1);
+      return;
+    }
+    if (code === "allocate" && type === "deallocate") {
+      addDelta(row, -1);
+      return;
+    }
+
+    // Backward compatibility with earlier temporary codes.
+    if (code === "deallocate") {
+      addDelta(row, -1);
+      return;
+    }
+    if (code === "unpick" && type === "order line") {
+      addDelta(row, 1);
+    }
+  });
 
   return balances;
 }
@@ -2472,8 +2477,8 @@ async function handleDeallocate(supabase, request) {
         });
 
         const { error: txErr } = await supabase.from("inventory_transaction").insert({
-          code: "Deallocate",
-          type: "Order Line",
+          code: "Allocate",
+          type: "Deallocate",
           client_id: line.client_id,
           sku: line.sku,
           location: bal.location,
@@ -2598,85 +2603,44 @@ async function handleUnpick(supabase, request) {
       if (!line) throw new Error(`Order line '${orderNum}/${lineId}' not found`);
       if (!line.client_id || !line.sku) throw new Error(`Order line '${orderNum}/${lineId}' is missing client_id or sku`);
 
+      const qtyAllocated = intFloor(line.qty_allocated, 0);
       const qtyPicked = intFloor(line.qty_picked, 0);
       if (qtyPicked <= 0) throw new Error(`Line '${orderNum}/${lineId}' has no picked qty to unpick`);
       if (qtyReq > qtyPicked) throw new Error(`Unpick qty ${qtyReq} exceeds picked qty ${qtyPicked}`);
+      if (qtyReq > qtyAllocated) {
+        throw new Error(`Unpick qty ${qtyReq} exceeds allocated qty ${qtyAllocated}`);
+      }
 
       const shipDock = hasShipDockColumn ? String(line.ship_dock || "").trim() : "";
-      if (!shipDock) throw new Error(`Line '${orderNum}/${lineId}' has no ship dock set`);
-
-      const sourceBalances = await getPickedLocationBalancesForOrderLine(supabase, line);
-      const sourceLocations = Array.from(sourceBalances.values())
-        .map((b) => ({ location: b.location, remaining_qty: Math.max(intFloor(b.remaining_qty, 0), 0) }))
-        .filter((b) => b.location && b.remaining_qty > 0)
-        .sort((a, b) => String(a.location).localeCompare(String(b.location), undefined, { sensitivity: "base" }));
-
-      let sourceTotal = 0;
-      sourceLocations.forEach((s) => {
-        sourceTotal += s.remaining_qty;
-      });
-      if (sourceTotal < qtyReq) {
-        throw new Error(`Line '${orderNum}/${lineId}' has only ${sourceTotal} picked-by-location balance; cannot unpick ${qtyReq}`);
-      }
-
-      await moveAvailableOutOfLocation(supabase, {
-        clientId: line.client_id,
-        sku: line.sku,
-        location: shipDock,
-        qty: qtyReq,
-      });
-
-      let remaining = qtyReq;
-      for (const src of sourceLocations) {
-        if (remaining <= 0) break;
-        const giveBack = Math.min(src.remaining_qty, remaining);
-        if (giveBack <= 0) continue;
-
-        await addAllocatedToLocation(supabase, {
-          clientId: line.client_id,
-          sku: line.sku,
-          location: src.location,
-          qty: giveBack,
-        });
-
-        const { error: txErr } = await supabase.from("inventory_transaction").insert({
-          code: "Unpick",
-          type: "Order Line",
-          client_id: line.client_id,
-          sku: line.sku,
-          location: src.location,
-          qty: giveBack,
-          order: orderNum,
-          order_line_id: lineId,
-          description: `Unpicked back to allocated at ${src.location}`,
-          status: "Allocated",
-        });
-        if (txErr) throw txErr;
-
-        remaining -= giveBack;
-      }
-
-      const { error: dockTxErr } = await supabase.from("inventory_transaction").insert({
-        code: "Unpick",
-        type: "Ship Dock Return",
-        client_id: line.client_id,
-        sku: line.sku,
-        location: shipDock,
-        qty: qtyReq,
-        order: orderNum,
-        order_line_id: lineId,
-        description: `Returned from ship dock ${shipDock}`,
-        status: "Allocated",
-      });
-      if (dockTxErr) throw dockTxErr;
-
       const nextPicked = qtyPicked - qtyReq;
+      const nextAllocated = qtyAllocated - qtyReq;
+      const updatePayload = { qty_picked: nextPicked, qty_allocated: nextAllocated };
+      if (hasShipDockColumn && nextPicked <= 0 && nextAllocated <= 0) {
+        updatePayload.ship_dock = null;
+      }
+
       const { error: lineErr } = await supabase
         .from("order_lines")
-        .update({ qty_picked: nextPicked })
+        .update(updatePayload)
         .eq(pgCol("order"), orderNum)
         .eq("line_id", lineId);
       if (lineErr) throw lineErr;
+
+      const { error: txErr } = await supabase.from("inventory_transaction").insert({
+        code: "Pick",
+        type: "Unpick",
+        client_id: line.client_id,
+        sku: line.sku,
+        location: shipDock || null,
+        qty: qtyReq,
+        order: orderNum,
+        order_line_id: lineId,
+        description: shipDock
+          ? `Unpicked and deallocated at ship dock ${shipDock}`
+          : "Unpicked and deallocated",
+        status: "Ready",
+      });
+      if (txErr) throw txErr;
 
       updatedOrders.add(orderNum);
       unpickedLines += 1;
