@@ -607,6 +607,57 @@ async function getShipDockLocationSetForClient(supabase, clientId) {
   return set;
 }
 
+function normalizeLocationKey(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+async function getAllocatedLocationBalancesForOrderLine(supabase, line) {
+  const orderNum = String(line?.order || "").trim();
+  const lineId = String(line?.line_id || "").trim();
+  const clientId = String(line?.client_id || "").trim();
+  const sku = String(line?.sku || "").trim();
+  if (!orderNum || !lineId || !clientId || !sku) return new Map();
+
+  const baseQueryFactory = () =>
+    supabase
+      .from("inventory_transaction")
+      .select("location,qty")
+      .eq("client_id", clientId)
+      .eq("sku", sku)
+      .ilike(pgCol("order"), orderNum)
+      .ilike("order_line_id", lineId);
+
+  const allocateRows = await fetchAllRows(
+    () => baseQueryFactory().eq("code", "Allocate").eq("type", "Order Line"),
+    1000,
+    200000
+  );
+  const pickRows = await fetchAllRows(
+    () => baseQueryFactory().eq("code", "Pick").eq("type", "Order Line"),
+    1000,
+    200000
+  );
+
+  const balances = new Map();
+  const addDelta = (row, deltaSign) => {
+    const location = String(row?.location || "").trim();
+    if (!location) return;
+    const qty = intFloor(row?.qty, 0);
+    if (qty <= 0) return;
+
+    const key = normalizeLocationKey(location);
+    const entry = balances.get(key) || { location, remaining_qty: 0 };
+    entry.remaining_qty += deltaSign * qty;
+    if (!entry.location) entry.location = location;
+    balances.set(key, entry);
+  };
+
+  allocateRows.forEach((row) => addDelta(row, 1));
+  pickRows.forEach((row) => addDelta(row, -1));
+
+  return balances;
+}
+
 async function logStatusChange(supabase, tableKey, pkValues) {
   const cfg = STATUS_LOG_FIELDS[tableKey];
   if (!cfg) return;
@@ -1745,6 +1796,8 @@ async function handlePickOrderLoad(supabase, searchParams) {
     const qtyPicked = intFloor(line.qty_picked, 0);
     const remainingToPick = Math.max(qtyAllocated - qtyPicked, 0);
 
+    const allocatedByLocation = await getAllocatedLocationBalancesForOrderLine(supabase, line);
+
     const locations = await fetchAllRows(
       () =>
         supabase
@@ -1764,10 +1817,42 @@ async function handlePickOrderLoad(supabase, searchParams) {
       shipDockSetByClient.set(line.client_id, shipDockSet);
     }
 
-    const filteredLocations = (locations || []).filter((loc) => {
-      const locName = String(loc.location || "").toLowerCase();
-      return !shipDockSet.has(locName);
+    const inventoryByLocation = new Map();
+    (locations || []).forEach((loc) => {
+      const key = normalizeLocationKey(loc.location);
+      if (!key) return;
+      const prev = inventoryByLocation.get(key) || {
+        location: loc.location,
+        qty_available: 0,
+        qty_allocated: 0,
+      };
+      prev.qty_available += intFloor(loc.qty_available, 0);
+      prev.qty_allocated += intFloor(loc.qty_allocated, 0);
+      if (!prev.location && loc.location) prev.location = loc.location;
+      inventoryByLocation.set(key, prev);
     });
+
+    const filteredLocations = [];
+    for (const [key, allocLoc] of allocatedByLocation.entries()) {
+      if (shipDockSet.has(key)) continue;
+      const remainingForLine = Math.max(intFloor(allocLoc.remaining_qty, 0), 0);
+      if (remainingForLine <= 0) continue;
+
+      const inv = inventoryByLocation.get(key) || {
+        location: allocLoc.location,
+        qty_available: 0,
+        qty_allocated: 0,
+      };
+
+      filteredLocations.push({
+        location: inv.location || allocLoc.location,
+        qty_available: Math.max(intFloor(inv.qty_available, 0), 0),
+        qty_allocated: Math.max(intFloor(inv.qty_allocated, 0), 0),
+        qty_allocated_for_line: remainingForLine,
+      });
+    }
+
+    filteredLocations.sort((a, b) => String(a.location || "").localeCompare(String(b.location || ""), undefined, { sensitivity: "base" }));
 
     resultLines.push({
       ...line,
@@ -1780,6 +1865,7 @@ async function handlePickOrderLoad(supabase, searchParams) {
         location: loc.location,
         qty_available: intFloor(loc.qty_available, 0),
         qty_allocated: intFloor(loc.qty_allocated, 0),
+        qty_allocated_for_line: intFloor(loc.qty_allocated_for_line, 0),
       })),
     });
   }
@@ -1877,6 +1963,23 @@ async function handlePickLine(supabase, request) {
     return responseJson({ error: `Pick qty ${qty} exceeds remaining qty ${remainingToPick}` }, 400);
   }
 
+  const allocatedByLocation = await getAllocatedLocationBalancesForOrderLine(supabase, line);
+  const pickedLocKey = normalizeLocationKey(location);
+  const allocAtLocation = allocatedByLocation.get(pickedLocKey);
+  const remainingAllocAtLocation = allocAtLocation ? Math.max(intFloor(allocAtLocation.remaining_qty, 0), 0) : 0;
+  if (remainingAllocAtLocation <= 0) {
+    return responseJson(
+      { error: `Line '${orderNum}/${lineId}' is not allocated from location '${location}'. Pick from an allocated source location.` },
+      400
+    );
+  }
+  if (qty > remainingAllocAtLocation) {
+    return responseJson(
+      { error: `Pick qty ${qty} exceeds allocated qty ${remainingAllocAtLocation} at location '${location}' for line '${orderNum}/${lineId}'.` },
+      400
+    );
+  }
+
   const hasSuspenseCol = await tableHasColumn(supabase, "inventory", "suspense");
   const invSelectCols = hasSuspenseCol
     ? "id,location,qty_available,qty_allocated,suspense"
@@ -1889,7 +1992,7 @@ async function handlePickLine(supabase, request) {
         .select(invSelectCols)
         .eq("client_id", line.client_id)
         .eq("sku", line.sku)
-        .eq("location", location)
+        .ilike("location", location)
         .or("qty_available.gt.0,qty_allocated.gt.0")
         .order("id", { ascending: true }),
     1000,

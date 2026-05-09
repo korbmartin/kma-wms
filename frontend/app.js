@@ -3456,7 +3456,7 @@ async function renderPickAction() {
     (line.locations || []).forEach((loc) => {
       const opt = document.createElement("option");
       opt.value = loc.location;
-      opt.textContent = `${loc.location} (alloc ${loc.qty_allocated || 0}, avail ${loc.qty_available || 0})`;
+      opt.textContent = `${loc.location} (line alloc ${loc.qty_allocated_for_line || 0}, alloc ${loc.qty_allocated || 0}, avail ${loc.qty_available || 0})`;
       locSelect.appendChild(opt);
     });
     locField.appendChild(locLabel);
