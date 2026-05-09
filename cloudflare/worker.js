@@ -232,6 +232,8 @@ const TABLE_COLUMN_FALLBACKS = {
     { column_name: "client_id", data_type: "text" },
     { column_name: "sku", data_type: "text" },
     { column_name: "location", data_type: "text" },
+    { column_name: "suspense", data_type: "integer" },
+    { column_name: "qty_unpicked", data_type: "integer" },
     { column_name: "qty_available", data_type: "integer" },
     { column_name: "qty_allocated", data_type: "integer" },
     { column_name: "tag_id", data_type: "text" },
@@ -1700,6 +1702,49 @@ async function addAllocatedToLocation(supabase, { clientId, sku, location, qty }
   return addQty;
 }
 
+async function addQtyUnpickedToLocation(supabase, { clientId, sku, location, qty }) {
+  const client = String(clientId || "").trim();
+  const skuVal = String(sku || "").trim();
+  const locationVal = String(location || "").trim();
+  const addQty = intFloor(qty, 0);
+  if (!client || !skuVal || !locationVal || addQty <= 0) return 0;
+
+  const hasQtyUnpickedCol = await tableHasColumn(supabase, "inventory", "qty_unpicked");
+  if (!hasQtyUnpickedCol) return 0;
+
+  const rows = await fetchAllRows(
+    () =>
+      supabase
+        .from("inventory")
+        .select("id,qty_unpicked")
+        .eq("client_id", client)
+        .eq("sku", skuVal)
+        .ilike("location", locationVal)
+        .order("id", { ascending: true }),
+    1000,
+    200000
+  );
+
+  if (rows.length > 0) {
+    const row = rows[0];
+    const nextQtyUnpicked = intFloor(row.qty_unpicked, 0) + addQty;
+    const { error } = await supabase.from("inventory").update({ qty_unpicked: nextQtyUnpicked }).eq("id", row.id);
+    if (error) throw error;
+  } else {
+    const { error } = await supabase.from("inventory").insert({
+      client_id: client,
+      sku: skuVal,
+      location: locationVal,
+      qty_available: 0,
+      qty_allocated: 0,
+      qty_unpicked: addQty,
+    });
+    if (error) throw error;
+  }
+
+  return addQty;
+}
+
 async function handleAllocateSearchOrders(supabase, searchParams) {
   let query = supabase
     .from("order_header")
@@ -2666,6 +2711,15 @@ async function handleUnpick(supabase, request) {
         .eq(pgCol("order"), orderNum)
         .eq("line_id", lineId);
       if (lineErr) throw lineErr;
+
+      if (shipDock) {
+        await addQtyUnpickedToLocation(supabase, {
+          clientId: line.client_id,
+          sku: line.sku,
+          location: shipDock,
+          qty: qtyReq,
+        });
+      }
 
       const { error: txErr } = await supabase.from("inventory_transaction").insert({
         code: unpickCode,
