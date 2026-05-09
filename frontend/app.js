@@ -136,6 +136,8 @@ const TABLE_LABELS = {
 const ACTION_LABELS = {
   allocate: "Allocate",
   pick: "Pick",
+  unpick: "Unpick",
+  deallocate: "Deallocate",
   stock_check: "Stock Check",
 };
 
@@ -2803,6 +2805,8 @@ importBody.addEventListener("input", () => updateImportRowCount());
 const ACTION_HINTS = {
   allocate: "Find orders, select lines to allocate, then assign a valid ship dock for the client.",
   pick: "Pick one order at a time, line by line, from warehouse locations.",
+  unpick: "Reverse picked stock from ship dock back into allocated stock for selected order lines.",
+  deallocate: "Release unpicked allocated stock back to available stock for selected order lines.",
   stock_check: "Double-scan a location, then reconcile counted stock with system stock.",
 };
 
@@ -2890,6 +2894,16 @@ function defaultActionState(actionKey) {
       currentIndex: 0,
       resultLines: [],
       pendingAdjustment: null,
+    };
+  }
+  if (actionKey === "unpick" || actionKey === "deallocate") {
+    return {
+      step: 1,
+      order: "",
+      lines: [],
+      selectedLines: [],
+      qtyByLine: {},
+      result: null,
     };
   }
   return {
@@ -3076,6 +3090,14 @@ async function renderActionTab(actionKey, savedState) {
   }
   if (actionKey === "pick") {
     await renderPickAction();
+    return;
+  }
+  if (actionKey === "unpick") {
+    await renderUnpickAction();
+    return;
+  }
+  if (actionKey === "deallocate") {
+    await renderDeallocateAction();
     return;
   }
   await renderStockCheckAction();
@@ -3595,6 +3617,356 @@ async function renderPickAction() {
   }
 
   await renderActionTab("pick", null);
+}
+
+async function renderUnpickAction() {
+  const state = actionState || defaultActionState("unpick");
+  setActiveActionState(state);
+  clearNode(actionBody);
+
+  if (state.step === 1) {
+    const card = makeActionCard("Step 1: Enter Order Number");
+    const row = document.createElement("div");
+    row.className = "action-row";
+    const orderField = makeActionInput("Order", state.order, (val) => {
+      state.order = val.trim();
+      setActiveActionState(state);
+    });
+    row.appendChild(orderField.wrap);
+    row.appendChild(makeActionButton("Load Picked Lines", "btn-create", async () => {
+      if (!state.order) {
+        setActionStatus("Enter an order number first.", "error");
+        return;
+      }
+      try {
+        const res = await fetch(`${API_BASE}/actions/unpick/order?order=${encodeURIComponent(state.order)}`);
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || "Failed to load picked lines");
+        state.lines = data.lines || [];
+        state.selectedLines = [];
+        state.qtyByLine = {};
+        state.lines.forEach((line) => {
+          const key = `${line.order}::${line.line_id}`;
+          state.qtyByLine[key] = String(line.max_unpick || 0);
+        });
+        state.step = 2;
+        setActiveActionState(state);
+        await renderUnpickAction();
+      } catch (err) {
+        setActionStatus(err.message || "Failed to load picked lines", "error");
+      }
+    }));
+    card.appendChild(row);
+    actionBody.appendChild(card);
+    return;
+  }
+
+  if (state.step === 2) {
+    const card = makeActionCard("Step 2: Select Lines and Qty to Unpick");
+    if (!state.lines.length) {
+      const empty = document.createElement("p");
+      empty.textContent = "No picked lines found for this order.";
+      card.appendChild(empty);
+      const row = document.createElement("div");
+      row.className = "action-row";
+      row.appendChild(makeActionButton("Back", "btn-secondary", async () => {
+        state.step = 1;
+        setActiveActionState(state);
+        await renderUnpickAction();
+      }));
+      card.appendChild(row);
+      actionBody.appendChild(card);
+      return;
+    }
+
+    const wrap = document.createElement("div");
+    wrap.className = "action-table-wrap";
+    const table = document.createElement("table");
+    table.className = "action-table";
+    table.innerHTML = "<thead><tr><th>Order</th><th>Line</th><th>Client</th><th>SKU</th><th>Ship Dock</th><th>Qty Allocated</th><th>Qty Picked</th><th>Max Unpick</th><th>Qty To Unpick</th></tr></thead>";
+    const tbody = document.createElement("tbody");
+    state.lines.forEach((line) => {
+      const key = `${line.order}::${line.line_id}`;
+      const tr = document.createElement("tr");
+      tr.setAttribute("data-row-key", key);
+      if (state.selectedLines.includes(key)) tr.classList.add("selected");
+      tr.innerHTML = `<td>${line.order || ""}</td><td>${line.line_id || ""}</td><td>${line.client_id || ""}</td><td>${line.sku || ""}</td><td>${line.ship_dock || ""}</td><td>${line.qty_allocated || 0}</td><td>${line.qty_picked || 0}</td><td>${line.max_unpick || 0}</td><td></td>`;
+      const qtyInput = document.createElement("input");
+      qtyInput.type = "number";
+      qtyInput.min = "0";
+      qtyInput.value = state.qtyByLine[key] || "0";
+      qtyInput.addEventListener("input", () => {
+        state.qtyByLine[key] = qtyInput.value;
+        setActiveActionState(state);
+      });
+      tr.children[8].appendChild(qtyInput);
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    wrap.appendChild(table);
+    card.appendChild(wrap);
+
+    const selectionHint = document.createElement("p");
+    selectionHint.className = "query-hint";
+    selectionHint.textContent = "Select lines using click / Ctrl+click / Shift+click / drag.";
+    card.appendChild(selectionHint);
+    attachGridSelection(tbody, (selectedKeys) => {
+      state.selectedLines = selectedKeys;
+      setActiveActionState(state);
+    });
+
+    const nav = document.createElement("div");
+    nav.className = "action-row";
+    nav.appendChild(makeActionButton("Back", "btn-secondary", async () => {
+      state.step = 1;
+      setActiveActionState(state);
+      await renderUnpickAction();
+    }));
+    nav.appendChild(makeActionButton("Apply Unpick", "btn-create", async () => {
+      const selected = state.selectedLines.filter((k) => Number(state.qtyByLine[k] || 0) > 0);
+      if (!selected.length) {
+        setActionStatus("Select at least one line with qty greater than 0.", "error");
+        return;
+      }
+      const payloadLines = [];
+      for (const key of selected) {
+        const ids = parseLineKey(key);
+        const line = state.lines.find((l) => `${l.order}::${l.line_id}` === key);
+        const qty = Number(state.qtyByLine[key] || 0);
+        const max = Number(line?.max_unpick || 0);
+        if (!Number.isFinite(qty) || qty <= 0) continue;
+        if (qty > max) {
+          setActionStatus(`Qty to unpick cannot exceed max (${max}) for ${ids.order}/${ids.line_id}.`, "error");
+          return;
+        }
+        payloadLines.push({ ...ids, qty });
+      }
+
+      if (!payloadLines.length) {
+        setActionStatus("No valid lines to unpick.", "error");
+        return;
+      }
+
+      try {
+        const res = await fetch(`${API_BASE}/actions/unpick`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ lines: payloadLines }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || "Unpick failed");
+        state.result = data;
+        state.step = 3;
+        setActiveActionState(state);
+        await renderUnpickAction();
+      } catch (err) {
+        setActionStatus(err.message || "Unpick failed", "error");
+      }
+    }));
+    card.appendChild(nav);
+    actionBody.appendChild(card);
+    return;
+  }
+
+  const done = state.result || {};
+  const card = makeActionCard("Unpick Completed");
+  const summary = document.createElement("p");
+  summary.textContent = `Unpicked lines: ${done.unpicked_lines || 0}. Unpicked qty: ${done.unpicked_qty || 0}. Updated orders: ${done.updated_orders || 0}.`;
+  card.appendChild(summary);
+
+  if (Array.isArray(done.errors) && done.errors.length > 0) {
+    const errTitle = document.createElement("p");
+    errTitle.style.marginTop = "0.8rem";
+    errTitle.textContent = "Lines with errors:";
+    card.appendChild(errTitle);
+    const ul = document.createElement("ul");
+    done.errors.forEach((e) => {
+      const li = document.createElement("li");
+      li.textContent = `Row ${e.row || "?"}: ${e.error || "Unknown error"}`;
+      ul.appendChild(li);
+    });
+    card.appendChild(ul);
+  }
+
+  card.appendChild(makeActionButton("Start New Unpick", "btn-create", async () => {
+    await renderActionTab("unpick", null);
+  }));
+  actionBody.appendChild(card);
+}
+
+async function renderDeallocateAction() {
+  const state = actionState || defaultActionState("deallocate");
+  setActiveActionState(state);
+  clearNode(actionBody);
+
+  if (state.step === 1) {
+    const card = makeActionCard("Step 1: Enter Order Number");
+    const row = document.createElement("div");
+    row.className = "action-row";
+    const orderField = makeActionInput("Order", state.order, (val) => {
+      state.order = val.trim();
+      setActiveActionState(state);
+    });
+    row.appendChild(orderField.wrap);
+    row.appendChild(makeActionButton("Load Allocated Lines", "btn-create", async () => {
+      if (!state.order) {
+        setActionStatus("Enter an order number first.", "error");
+        return;
+      }
+      try {
+        const res = await fetch(`${API_BASE}/actions/deallocate/order?order=${encodeURIComponent(state.order)}`);
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || "Failed to load allocated lines");
+        state.lines = data.lines || [];
+        state.selectedLines = [];
+        state.qtyByLine = {};
+        state.lines.forEach((line) => {
+          const key = `${line.order}::${line.line_id}`;
+          state.qtyByLine[key] = String(line.max_deallocate || 0);
+        });
+        state.step = 2;
+        setActiveActionState(state);
+        await renderDeallocateAction();
+      } catch (err) {
+        setActionStatus(err.message || "Failed to load allocated lines", "error");
+      }
+    }));
+    card.appendChild(row);
+    actionBody.appendChild(card);
+    return;
+  }
+
+  if (state.step === 2) {
+    const card = makeActionCard("Step 2: Select Lines and Qty to Deallocate");
+    if (!state.lines.length) {
+      const empty = document.createElement("p");
+      empty.textContent = "No unpicked allocated lines found for this order.";
+      card.appendChild(empty);
+      const row = document.createElement("div");
+      row.className = "action-row";
+      row.appendChild(makeActionButton("Back", "btn-secondary", async () => {
+        state.step = 1;
+        setActiveActionState(state);
+        await renderDeallocateAction();
+      }));
+      card.appendChild(row);
+      actionBody.appendChild(card);
+      return;
+    }
+
+    const wrap = document.createElement("div");
+    wrap.className = "action-table-wrap";
+    const table = document.createElement("table");
+    table.className = "action-table";
+    table.innerHTML = "<thead><tr><th>Order</th><th>Line</th><th>Client</th><th>SKU</th><th>Qty Ordered</th><th>Qty Allocated</th><th>Qty Picked</th><th>Max Deallocate</th><th>Qty To Deallocate</th></tr></thead>";
+    const tbody = document.createElement("tbody");
+    state.lines.forEach((line) => {
+      const key = `${line.order}::${line.line_id}`;
+      const tr = document.createElement("tr");
+      tr.setAttribute("data-row-key", key);
+      if (state.selectedLines.includes(key)) tr.classList.add("selected");
+      tr.innerHTML = `<td>${line.order || ""}</td><td>${line.line_id || ""}</td><td>${line.client_id || ""}</td><td>${line.sku || ""}</td><td>${line.qty_ordered || 0}</td><td>${line.qty_allocated || 0}</td><td>${line.qty_picked || 0}</td><td>${line.max_deallocate || 0}</td><td></td>`;
+      const qtyInput = document.createElement("input");
+      qtyInput.type = "number";
+      qtyInput.min = "0";
+      qtyInput.value = state.qtyByLine[key] || "0";
+      qtyInput.addEventListener("input", () => {
+        state.qtyByLine[key] = qtyInput.value;
+        setActiveActionState(state);
+      });
+      tr.children[8].appendChild(qtyInput);
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    wrap.appendChild(table);
+    card.appendChild(wrap);
+
+    const selectionHint = document.createElement("p");
+    selectionHint.className = "query-hint";
+    selectionHint.textContent = "Select lines using click / Ctrl+click / Shift+click / drag.";
+    card.appendChild(selectionHint);
+    attachGridSelection(tbody, (selectedKeys) => {
+      state.selectedLines = selectedKeys;
+      setActiveActionState(state);
+    });
+
+    const nav = document.createElement("div");
+    nav.className = "action-row";
+    nav.appendChild(makeActionButton("Back", "btn-secondary", async () => {
+      state.step = 1;
+      setActiveActionState(state);
+      await renderDeallocateAction();
+    }));
+    nav.appendChild(makeActionButton("Apply Deallocate", "btn-create", async () => {
+      const selected = state.selectedLines.filter((k) => Number(state.qtyByLine[k] || 0) > 0);
+      if (!selected.length) {
+        setActionStatus("Select at least one line with qty greater than 0.", "error");
+        return;
+      }
+      const payloadLines = [];
+      for (const key of selected) {
+        const ids = parseLineKey(key);
+        const line = state.lines.find((l) => `${l.order}::${l.line_id}` === key);
+        const qty = Number(state.qtyByLine[key] || 0);
+        const max = Number(line?.max_deallocate || 0);
+        if (!Number.isFinite(qty) || qty <= 0) continue;
+        if (qty > max) {
+          setActionStatus(`Qty to deallocate cannot exceed max (${max}) for ${ids.order}/${ids.line_id}.`, "error");
+          return;
+        }
+        payloadLines.push({ ...ids, qty });
+      }
+
+      if (!payloadLines.length) {
+        setActionStatus("No valid lines to deallocate.", "error");
+        return;
+      }
+
+      try {
+        const res = await fetch(`${API_BASE}/actions/deallocate`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ lines: payloadLines }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || "Deallocate failed");
+        state.result = data;
+        state.step = 3;
+        setActiveActionState(state);
+        await renderDeallocateAction();
+      } catch (err) {
+        setActionStatus(err.message || "Deallocate failed", "error");
+      }
+    }));
+    card.appendChild(nav);
+    actionBody.appendChild(card);
+    return;
+  }
+
+  const done = state.result || {};
+  const card = makeActionCard("Deallocate Completed");
+  const summary = document.createElement("p");
+  summary.textContent = `Deallocated lines: ${done.deallocated_lines || 0}. Deallocated qty: ${done.deallocated_qty || 0}. Updated orders: ${done.updated_orders || 0}.`;
+  card.appendChild(summary);
+
+  if (Array.isArray(done.errors) && done.errors.length > 0) {
+    const errTitle = document.createElement("p");
+    errTitle.style.marginTop = "0.8rem";
+    errTitle.textContent = "Lines with errors:";
+    card.appendChild(errTitle);
+    const ul = document.createElement("ul");
+    done.errors.forEach((e) => {
+      const li = document.createElement("li");
+      li.textContent = `Row ${e.row || "?"}: ${e.error || "Unknown error"}`;
+      ul.appendChild(li);
+    });
+    card.appendChild(ul);
+  }
+
+  card.appendChild(makeActionButton("Start New Deallocate", "btn-create", async () => {
+    await renderActionTab("deallocate", null);
+  }));
+  actionBody.appendChild(card);
 }
 
 async function renderStockCheckAction() {
