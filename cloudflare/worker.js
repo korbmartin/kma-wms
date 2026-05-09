@@ -2627,7 +2627,7 @@ async function handleUnpick(supabase, request) {
       if (lineErr) throw lineErr;
 
       const { error: txErr } = await supabase.from("inventory_transaction").insert({
-        code: "Pick",
+        code: "Allocate",
         type: "Unpick",
         client_id: line.client_id,
         sku: line.sku,
@@ -2640,7 +2640,9 @@ async function handleUnpick(supabase, request) {
           : "Unpicked and deallocated",
         status: "Ready",
       });
-      if (txErr) throw txErr;
+      if (txErr) {
+        console.error("Unpick audit log insert failed:", sanitizeMessage(txErr));
+      }
 
       updatedOrders.add(orderNum);
       unpickedLines += 1;
