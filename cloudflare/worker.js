@@ -587,6 +587,39 @@ async function getCanonicalSkuForClient(supabase, clientId, sku) {
   return rows.length > 0 ? rows[0].sku : null;
 }
 
+async function resolveTransactionCode(supabase, preferredCode, fallbackCodes = []) {
+  const preferred = String(preferredCode || "").trim().toLowerCase();
+  const fallbackList = (Array.isArray(fallbackCodes) ? fallbackCodes : [])
+    .map((c) => String(c || "").trim())
+    .filter(Boolean);
+
+  if (!preferred && fallbackList.length === 0) return null;
+
+  const rows = await fetchAllRows(
+    () => supabase.from("transaction_codes").select("code"),
+    1000,
+    200000
+  );
+
+  const byLower = new Map();
+  for (const row of rows) {
+    const code = String(row?.code || "").trim();
+    if (!code) continue;
+    byLower.set(code.toLowerCase(), code);
+  }
+
+  if (preferred && byLower.has(preferred)) {
+    return byLower.get(preferred);
+  }
+
+  for (const fallback of fallbackList) {
+    const key = fallback.toLowerCase();
+    if (byLower.has(key)) return byLower.get(key);
+  }
+
+  return null;
+}
+
 async function getShipDockLocationSetForClient(supabase, clientId) {
   const client = String(clientId || "").trim();
   if (!client) return new Set();
@@ -2413,6 +2446,10 @@ async function handleDeallocate(supabase, request) {
   if (!lines.length) return responseJson({ error: "No lines provided" }, 400);
   if (lines.length > 5000) return responseJson({ error: "Maximum 5000 lines per request" }, 400);
   const hasShipDockColumn = await tableHasColumn(supabase, "order_lines", "ship_dock");
+  const deallocateCode = await resolveTransactionCode(supabase, "deallocate", ["Allocate"]);
+  if (!deallocateCode) {
+    throw new Error("No valid transaction code found for deallocate. Add 'deallocate' (or 'Allocate') in transaction_codes.");
+  }
 
   let deallocatedLines = 0;
   let deallocatedQty = 0;
@@ -2477,7 +2514,7 @@ async function handleDeallocate(supabase, request) {
         });
 
         const { error: txErr } = await supabase.from("inventory_transaction").insert({
-          code: "Allocate",
+          code: deallocateCode,
           type: "Deallocate",
           client_id: line.client_id,
           sku: line.sku,
@@ -2575,6 +2612,10 @@ async function handleUnpick(supabase, request) {
   if (lines.length > 5000) return responseJson({ error: "Maximum 5000 lines per request" }, 400);
 
   const hasShipDockColumn = await tableHasColumn(supabase, "order_lines", "ship_dock");
+  const unpickCode = await resolveTransactionCode(supabase, "unpick", ["Pick", "Allocate"]);
+  if (!unpickCode) {
+    throw new Error("No valid transaction code found for unpick. Add 'unpick' (or 'Pick'/'Allocate') in transaction_codes.");
+  }
   let unpickedLines = 0;
   let unpickedQty = 0;
   const updatedOrders = new Set();
@@ -2627,7 +2668,7 @@ async function handleUnpick(supabase, request) {
       if (lineErr) throw lineErr;
 
       const { error: txErr } = await supabase.from("inventory_transaction").insert({
-        code: "Allocate",
+        code: unpickCode,
         type: "Unpick",
         client_id: line.client_id,
         sku: line.sku,
